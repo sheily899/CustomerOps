@@ -1,0 +1,220 @@
+{
+  "report_type": "phase1_dataset_audit",
+  "agent": "C",
+  "independence": {
+    "other_audit_results_read": false,
+    "original_dataset_modified": false,
+    "source_code_modified": false,
+    "specification_modified": false
+  },
+  "dataset": {
+    "path": "D:/EchoMind/EchoMind/evaluation/datasets/phase1_generated_v1.json",
+    "dataset_version": "echomind-golden-phase1-v1.0-generated",
+    "knowledge_base_version": "kb-v1.0-default-docs",
+    "case_count": 10
+  },
+  "summary": {
+    "json_valid": true,
+    "case_ids_unique": true,
+    "required_case_fields_present": true,
+    "conversation_turn_roles_valid": true,
+    "entity_schema_valid": true,
+    "intent_enum_check": "pass",
+    "route_agent_enum_check": "pass",
+    "gold_chunk_content_hash_check": "6/6 passed",
+    "gold_document_chunk_consistency_check": "pass",
+    "overall_status": "blocked_pending_human_review_and_contract_resolution",
+    "issue_count": 22,
+    "severity_counts": {
+      "high": 18,
+      "medium": 4,
+      "low": 0
+    }
+  },
+  "positive_checks": [
+    "10 条 case 可解析且 case_id 唯一。",
+    "基础字段、主要 gold 标注段、turn 角色和实体键完整。",
+    "意图与 Agent 值均属于当前项目枚举。",
+    "6 个 gold chunk 的 UTF-8 SHA-256 全部通过，正文与默认 KB 一致。",
+    "gold_documents、gold_chunks、acceptable_chunks 引用关系一致；payment 没有伪造 payment 文档。",
+    "复合 case 保存 user/assistant/user 顺序并声明 error_code、order_id 记忆要求。"
+  ],
+  "issues": [
+    {
+      "case_id": "refund.single.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；provenance 说明为机器草稿，未完成人工初标。",
+      "recommendation": "完成业务人工初标；按风险等级完成双人复核、仲裁并记录 chunk_id/KB version。"
+    },
+    {
+      "case_id": "order.single.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；未完成人工初标。",
+      "recommendation": "完成业务人工初标并填写标注依据、置信度和仲裁状态。"
+    },
+    {
+      "case_id": "payment.single.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；risk_level=high 且备注要求至少两名业务人工复核。",
+      "recommendation": "双人复核重复扣款的升级边界、无 KB 回答和工具期望。"
+    },
+    {
+      "case_id": "security.single.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；risk_level=critical 且备注要求至少两名业务人工复核。",
+      "recommendation": "完成业务/安全双人复核并仲裁。"
+    },
+    {
+      "case_id": "technical.login.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；机器整理草稿。",
+      "recommendation": "完成技术支持人工初标。"
+    },
+    {
+      "case_id": "technical.crash.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；机器整理草稿。",
+      "recommendation": "完成技术支持人工初标并确认升级边界。"
+    },
+    {
+      "case_id": "handoff.single.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；risk_level=high，备注要求人工初标和高风险复核。",
+      "recommendation": "完成人工复核投诉、转人工和交接摘要口径。"
+    },
+    {
+      "case_id": "greeting.single.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；机器整理草稿。",
+      "recommendation": "完成人工初标并确认无需检索时的策略枚举。"
+    },
+    {
+      "case_id": "oos.single.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；备注已标记 OOS/other 映射待人工确认。",
+      "recommendation": "由产品/业务确认 OOS 标签边界后定稿。"
+    },
+    {
+      "case_id": "composite.multiturn.001",
+      "field": "evaluation.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "annotator_ids=[]、adjudicated=false、confidence=null；risk_level=high，备注要求双人复核复合路由与安全边界。",
+      "recommendation": "双人复核多轮记忆、双领域路由和工具顺序。"
+    },
+    {
+      "case_id": "refund.single.001",
+      "field": "gold_retrieval.gold_chunks[].chunk_id/document_id/version",
+      "severity": "medium",
+      "needs_human_review": true,
+      "evidence": "正文 SHA-256 通过，但 KnowledgeBase.add_documents 仅生成 md5 id 和 title/chunk_index/total_chunks 元数据，search 不返回生成数据中的 refund_policy#chunk_001、document_id 或 version（D:/EchoMind/EchoMind/mcp/knowledge_base.py:73-95,104-125）。",
+      "recommendation": "增加稳定 chunk/document/version 元数据或明确离线映射器。"
+    },
+    {
+      "case_id": "order.single.001",
+      "field": "gold_retrieval.gold_chunks[].chunk_id/document_id/version",
+      "severity": "medium",
+      "needs_human_review": true,
+      "evidence": "正文和哈希与默认订单文档一致，但运行时没有 order_query#chunk_001、content_hash 或 version（同文件:73-95,104-125）。",
+      "recommendation": "补充稳定 chunk 定位并执行运行时映射验证。"
+    },
+    {
+      "case_id": "security.single.001",
+      "field": "gold_route.primary_agent / gold_tools.required_tools / gold_route.should_escalate",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "primary_agent=billing、supporting_agents=[]，却要求 create_handoff_summary；该工具只在 EscalationAgent 注册，BillingAgent 工具范围无此工具（D:/EchoMind/EchoMind/agents/agent_orchestrator.py:470-507,510-534）。编排器也只按 response.escalate、CRITICAL 或 human-handoff 意图升级（同文件:776-784），本 case 为 account_security/high。",
+      "recommendation": "人工决定改为 escalation 路由或增加 supporting escalation，并使 critical 风险可触发运行时升级。"
+    },
+    {
+      "case_id": "payment.single.001",
+      "field": "gold_route.should_escalate / gold_safety.must_refuse_or_escalate / gold_answer.required_actions",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "数据将重复扣款 case 标为不升级；但账单规范和 BillingAgent handoff_conditions 都把重复扣款列为人工/财务审核条件（D:/EchoMind/EchoMind/skills/billing_support/SKILL.md；D:/EchoMind/EchoMind/agents/agent_orchestrator.py:470-479）。",
+      "recommendation": "人工确认升级触发点是疑似还是确认；统一路由、安全和必答动作。"
+    },
+    {
+      "case_id": "handoff.single.001",
+      "field": "gold_tools.required_tools / gold_tools.expected_tool_order",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "要求 create_handoff_summary，但 EscalationAgent.handle 直接返回文案且 tools_used=[]，未调用该工具（D:/EchoMind/EchoMind/agents/agent_orchestrator.py:536-558）。",
+      "recommendation": "实现真实工具调用并记录 trace，或按当前真实行为修正工具标注。"
+    },
+    {
+      "case_id": "greeting.single.001",
+      "field": "gold_answer.answer_policy",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "值为 direct_answer；规范第 4.6 节仅列 evidence_first、clarify_first、handoff_required、refuse。",
+      "recommendation": "确认扩展策略枚举，或改用现有枚举。"
+    },
+    {
+      "case_id": "oos.single.001",
+      "field": "scenario / gold_intent.intent / acceptable_intents",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "scenario=out_of_scope 但 intent=other；规范第 8.5 节要求二者不混用。当前 IntentCategory 仅有 OTHER、没有 out_of_scope（D:/EchoMind/EchoMind/core/intent_recognizer.py:29-48）。",
+      "recommendation": "人工决定新增 OOS 枚举，或正式声明并记录唯一映射；决定前不计入严格单标签准确率。"
+    },
+    {
+      "case_id": "oos.single.001",
+      "field": "gold_safety.must_refuse_or_escalate",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "值为 false，但 answer_policy=refuse 且 required_facts 要求拒绝业务外答案，字段语义冲突。",
+      "recommendation": "将安全开关与 refuse 对齐，或拆分 must_refuse/must_escalate。"
+    },
+    {
+      "case_id": "composite.multiturn.001",
+      "field": "gold_route.supporting_agents",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "要求 technical+ billing supporting；当前 _route_decision 的 billing 辅助分数对该文本约 0.18，低于 0.45 阈值，且 _collaboration_targets 仅定义未调用（D:/EchoMind/EchoMind/agents/agent_orchestrator.py:900-915,996-1027）。",
+      "recommendation": "增加可执行复合路由或人工确认并改写黄金路由。"
+    },
+    {
+      "case_id": "composite.multiturn.001",
+      "field": "gold_tools.required_tools / expected_tool_order",
+      "severity": "high",
+      "needs_human_review": true,
+      "evidence": "要求 check_billing_fields；若按当前 technical 路由执行，其工具范围只有 search_knowledge_base、lookup_error_code、build_diagnostic_plan（D:/EchoMind/EchoMind/agents/agent_orchestrator.py:438-449）。",
+      "recommendation": "先解决 supporting billing 路由，再验证三工具顺序；或拆成两个子任务。"
+    },
+    {
+      "case_id": "composite.multiturn.001",
+      "field": "memory_requirements / conversation.turns",
+      "severity": "medium",
+      "needs_human_review": true,
+      "evidence": "最后一轮再次给出 401，不依赖首轮记忆；IntentRecognizer 只对当前 message 提取实体、不合并 history（D:/EchoMind/EchoMind/core/intent_recognizer.py:172-203,373-387）。MemoryManager 15 条消息才压缩摘要，本 case 只有 3 turns。",
+      "recommendation": "改为真正依赖前文的指代表达，并明确 expected_summary_facts 的触发条件。"
+    },
+    {
+      "case_id": "composite.multiturn.001",
+      "field": "gold_retrieval.gold_documents / gold_answer.required_facts",
+      "severity": "medium",
+      "needs_human_review": true,
+      "evidence": "仅标注 technical chunk，却要求重复扣款金额/时间/渠道核验；该事实不在当前 KB，也没有按子查询标注无 KB 结果或事实来源。",
+      "recommendation": "拆分 technical/payment retrieval 子查询，并为每个 required_fact/action 标注 evidence source。"
+    }
+  ]
+}

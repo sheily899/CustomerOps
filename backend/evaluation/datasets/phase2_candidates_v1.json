@@ -1,0 +1,198 @@
+{
+  "dataset_name": "echomind-phase2-candidates",
+  "dataset_version": "echomind-phase2-candidates-v1.0",
+  "knowledge_base_version": "kb-v1.0-default-docs",
+  "status": "draft_for_review",
+  "cases": [
+    {
+      "case_id": "phase2.refund.001",
+      "user_question": "我在购买后第 5 天，想申请无理由退款，应该怎么做？",
+      "expected_intent": "refund",
+      "primary_agent": "billing",
+      "gold_chunk": {
+        "chunk_id": "refund_policy#chunk_001",
+        "document_id": "refund_policy",
+        "title": "退款政策",
+        "content_hash": "sha256:e4b40a68a4bd522e93e91479b81abf818e06ecc17cf217d716c4dbfe295ee3f7",
+        "content": "退款政策说明。用户在购买后 7 天内可以申请无理由退款。退款申请提交后，系统会在 1-3 个工作日内审核。审核通过后，款项将在 5-7 个工作日内退回原支付账户。如果商品已发货，需要先完成退货流程才能退款。退货运费由用户承担，除非是商品质量问题。超过 7 天但未超过 30 天的订单，需要提供商品质量问题的证据才能退款。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "购买后 7 天内可以申请无理由退款。提交申请后通常需要 1-3 个工作日审核，审核通过后一般在 5-7 个工作日内原路退回，具体时间以支付渠道为准。",
+      "should_escalate": false
+    },
+    {
+      "case_id": "phase2.refund.002",
+      "user_question": "订单已经超过 7 天但还没到 30 天，商品有质量问题，我想申请退款。",
+      "expected_intent": "refund",
+      "primary_agent": "billing",
+      "gold_chunk": {
+        "chunk_id": "refund_policy#chunk_001",
+        "document_id": "refund_policy",
+        "title": "退款政策",
+        "content_hash": "sha256:e4b40a68a4bd522e93e91479b81abf818e06ecc17cf217d716c4dbfe295ee3f7",
+        "content": "退款政策说明。用户在购买后 7 天内可以申请无理由退款。退款申请提交后，系统会在 1-3 个工作日内审核。审核通过后，款项将在 5-7 个工作日内退回原支付账户。如果商品已发货，需要先完成退货流程才能退款。退货运费由用户承担，除非是商品质量问题。超过 7 天但未超过 30 天的订单，需要提供商品质量问题的证据才能退款。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "超过 7 天但未超过 30 天的订单，需要提供商品质量问题的证据才能申请退款；如果商品已发货，还需要先完成退货流程。该情况建议由账单客服进一步核验处理。",
+      "should_escalate": true
+    },
+    {
+      "case_id": "phase2.order_status.001",
+      "user_question": "订单号是 A2001，我想查询现在的订单状态。",
+      "expected_intent": "order_status",
+      "primary_agent": "general",
+      "gold_chunk": {
+        "chunk_id": "order_query#chunk_001",
+        "document_id": "order_query",
+        "title": "订单查询",
+        "content_hash": "sha256:faae5da225a4662a81554146ba9b335c8d6b80220025f8e320706a2bc39a4ca0",
+        "content": "订单查询指南。用户可以通过订单号查询订单状态。订单状态包括：待支付、已支付、已发货、运输中、已签收、已完成。如果订单显示已发货但超过 7 天未收到，可以联系客服申请查件。物流信息通常在发货后 24 小时内更新。如果订单显示异常，请提供订单号联系客服处理。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "可以通过订单号查询具体状态。当前支持的状态包括待支付、已支付、已发货、运输中、已签收和已完成；但当前客服需要基于订单号查询，订单号是 A2001。",
+      "should_escalate": false
+    },
+    {
+      "case_id": "phase2.order_status.002",
+      "user_question": "我的订单有没有发货？物流信息通常多久更新？",
+      "expected_intent": "order_status",
+      "primary_agent": "general",
+      "gold_chunk": {
+        "chunk_id": "order_query#chunk_001",
+        "document_id": "order_query",
+        "title": "订单查询",
+        "content_hash": "sha256:faae5da225a4662a81554146ba9b335c8d6b80220025f8e320706a2bc39a4ca0",
+        "content": "订单查询指南。用户可以通过订单号查询订单状态。订单状态包括：待支付、已支付、已发货、运输中、已签收、已完成。如果订单显示已发货但超过 7 天未收到，可以联系客服申请查件。物流信息通常在发货后 24 小时内更新。如果订单显示异常，请提供订单号联系客服处理。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "请提供订单号后查询是否已发货。物流信息通常在发货后 24 小时内更新；如果订单显示已发货但超过 7 天未收到，可以联系客服申请查件。",
+      "should_escalate": false
+    },
+    {
+      "case_id": "phase2.technical_login.001",
+      "user_question": "登录时提示 401 Unauthorized，应该怎么办？",
+      "expected_intent": "technical_login",
+      "primary_agent": "technical",
+      "gold_chunk": {
+        "chunk_id": "technical_troubleshooting#chunk_001",
+        "document_id": "technical_troubleshooting",
+        "title": "技术故障排查",
+        "content_hash": "sha256:f60ada92831c5eb16025d315dc9d72a3df0680460d207b34993d521a1b78c938",
+        "content": "常见技术问题排查。应用崩溃：请尝试清除缓存后重启应用，如果问题持续请更新到最新版本。登录失败 401 错误：表示认证失败，请检查用户名密码是否正确，或尝试重置密码。页面加载慢：检查网络连接，尝试切换 WiFi 或移动数据。支付失败：确认银行卡余额充足，检查是否开启了网上支付功能。500 服务器错误：这是服务端问题，请稍后重试，如果持续出现请联系技术支持。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "401 表示认证失败。请自行检查用户名和密码是否正确，或尝试重置密码；不要发送密码或验证码。如果问题持续，请补充错误发生时间和运行环境。",
+      "should_escalate": false
+    },
+    {
+      "case_id": "phase2.technical_login.002",
+      "user_question": "登录认证失败并返回 401 错误，我是否需要重置密码？",
+      "expected_intent": "technical_login",
+      "primary_agent": "technical",
+      "gold_chunk": {
+        "chunk_id": "technical_troubleshooting#chunk_001",
+        "document_id": "technical_troubleshooting",
+        "title": "技术故障排查",
+        "content_hash": "sha256:f60ada92831c5eb16025d315dc9d72a3df0680460d207b34993d521a1b78c938",
+        "content": "常见技术问题排查。应用崩溃：请尝试清除缓存后重启应用，如果问题持续请更新到最新版本。登录失败 401 错误：表示认证失败，请检查用户名密码是否正确，或尝试重置密码。页面加载慢：检查网络连接，尝试切换 WiFi 或移动数据。支付失败：确认银行卡余额充足，检查是否开启了网上支付功能。500 服务器错误：这是服务端问题，请稍后重试，如果持续出现请联系技术支持。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "401 表示认证失败。可以先检查用户名和密码是否正确，必要时通过正常流程重置密码；不要发送密码或验证码。如果问题仍未解决，请联系技术支持并提供错误发生时间和运行环境。",
+      "should_escalate": false
+    },
+    {
+      "case_id": "phase2.technical_crash.001",
+      "user_question": "应用打开后一直崩溃，应该先怎么排查？",
+      "expected_intent": "technical_crash",
+      "primary_agent": "technical",
+      "gold_chunk": {
+        "chunk_id": "technical_troubleshooting#chunk_001",
+        "document_id": "technical_troubleshooting",
+        "title": "技术故障排查",
+        "content_hash": "sha256:f60ada92831c5eb16025d315dc9d72a3df0680460d207b34993d521a1b78c938",
+        "content": "常见技术问题排查。应用崩溃：请尝试清除缓存后重启应用，如果问题持续请更新到最新版本。登录失败 401 错误：表示认证失败，请检查用户名密码是否正确，或尝试重置密码。页面加载慢：检查网络连接，尝试切换 WiFi 或移动数据。支付失败：确认银行卡余额充足，检查是否开启了网上支付功能。500 服务器错误：这是服务端问题，请稍后重试，如果持续出现请联系技术支持。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "请先尝试清除缓存后重启应用；如果问题持续，请更新到最新版本。仍无法解决时，请联系技术支持。",
+      "should_escalate": false
+    },
+    {
+      "case_id": "phase2.technical_crash.002",
+      "user_question": "页面出现 500 服务器错误，稍后重试仍然存在怎么办？",
+      "expected_intent": "technical_crash",
+      "primary_agent": "technical",
+      "gold_chunk": {
+        "chunk_id": "technical_troubleshooting#chunk_001",
+        "document_id": "technical_troubleshooting",
+        "title": "技术故障排查",
+        "content_hash": "sha256:f60ada92831c5eb16025d315dc9d72a3df0680460d207b34993d521a1b78c938",
+        "content": "常见技术问题排查。应用崩溃：请尝试清除缓存后重启应用，如果问题持续请更新到最新版本。登录失败 401 错误：表示认证失败，请检查用户名密码是否正确，或尝试重置密码。页面加载慢：检查网络连接，尝试切换 WiFi 或移动数据。支付失败：确认银行卡余额充足，检查是否开启了网上支付功能。500 服务器错误：这是服务端问题，请稍后重试，如果持续出现请联系技术支持。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "500 表示服务端问题，可以先稍后重试；如果仍然出现，请记录错误信息并联系技术支持。",
+      "should_escalate": false
+    },
+    {
+      "case_id": "phase2.account_security.001",
+      "user_question": "我发现账户有异常登录，应该怎么办？",
+      "expected_intent": "account_security",
+      "primary_agent": "billing",
+      "gold_chunk": {
+        "chunk_id": "account_security#chunk_001",
+        "document_id": "account_security",
+        "title": "账户安全",
+        "content_hash": "sha256:4cbdb2edc53ea45c3cbb7c7b9955b8806174dadfb41ea646b390804141b440de",
+        "content": "账户安全说明。建议用户定期修改密码，密码长度至少 8 位，包含字母和数字。如果忘记密码，可以通过绑定的手机号或邮箱重置。发现账户异常登录时，系统会自动锁定账户并发送通知。用户可以在安全设置中开启两步验证，提高账户安全性。不要将密码分享给他人，客服人员不会索要用户密码。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "发现异常登录时，系统会自动锁定账户并发送通知。请尽快修改密码并检查安全设置，可开启两步验证；客服不会索要密码。由于涉及账户安全风险，将由账单客服承接并转人工进一步核验。",
+      "should_escalate": true
+    },
+    {
+      "case_id": "phase2.account_security.002",
+      "user_question": "我担心账户被盗，想重置密码并开启两步验证。",
+      "expected_intent": "account_security",
+      "primary_agent": "billing",
+      "gold_chunk": {
+        "chunk_id": "account_security#chunk_001",
+        "document_id": "account_security",
+        "title": "账户安全",
+        "content_hash": "sha256:4cbdb2edc53ea45c3cbb7c7b9955b8806174dadfb41ea646b390804141b440de",
+        "content": "账户安全说明。建议用户定期修改密码，密码长度至少 8 位，包含字母和数字。如果忘记密码，可以通过绑定的手机号或邮箱重置。发现账户异常登录时，系统会自动锁定账户并发送通知。用户可以在安全设置中开启两步验证，提高账户安全性。不要将密码分享给他人，客服人员不会索要用户密码。",
+        "source": "EchoMind/mcp/knowledge_base.py",
+        "version": "kb-v1.0-default-docs",
+        "relevance": 3,
+        "required": true
+      },
+      "reference_answer": "可以通过绑定的手机号或邮箱重置密码，并在安全设置中开启两步验证。密码建议至少 8 位且包含字母和数字；不要分享密码，客服不会索要密码。由于存在账户安全风险，将由账单客服承接并转人工核验。",
+      "should_escalate": true
+    }
+  ]
+}

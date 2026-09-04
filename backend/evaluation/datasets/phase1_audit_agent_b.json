@@ -1,0 +1,352 @@
+{
+  "report_type": "echomind_phase1_dataset_audit",
+  "agent": "B",
+  "audited_at": "2026-09-04",
+  "dataset_path": "D:\\EchoMind\\EchoMind\\evaluation\\datasets\\phase1_generated_v1.json",
+  "scope": {
+    "read_only_inputs": [
+      "D:\\EchoMind\\EchoMind\\evaluation\\datasets\\phase1_generated_v1.json",
+      "D:\\EchoMind\\EchoMind\\wiki\\EchoMind评测数据集规范.md",
+      "D:\\EchoMind\\EchoMind\\mcp\\knowledge_base.py",
+      "D:\\EchoMind\\EchoMind\\core\\intent_recognizer.py"
+    ],
+    "excluded": [
+      "其他审计结果",
+      "源码和规范的修改",
+      "未列入上述范围的工具注册表、路由实现和运行时数据库"
+    ]
+  },
+  "dataset_snapshot": {
+    "json_parseable": true,
+    "case_count": 10,
+    "case_ids_unique": true,
+    "status": "draft_for_review",
+    "dataset_version": "echomind-golden-phase1-v1.0-generated",
+    "knowledge_base_version": "kb-v1.0-default-docs"
+  },
+  "conclusion": {
+    "stage1_ready": false,
+    "severity_counts": {
+      "high": 11,
+      "medium": 5,
+      "low": 0,
+      "critical": 0
+    },
+    "blocking_reasons": [
+      "数据仍是机器草稿，所有 case 均没有人工初标；高风险 case 也没有双人复核和仲裁。",
+      "当前 KnowledgeBase 不返回稳定 document_id/chunk_id/content_hash/version，Golden Chunk 不能直接与检索结果做稳定映射。",
+      "数据集使用 search_knowledge_base，但 knowledge_base.py 的 MCP 示例注册名为 knowledge_search；工具评测存在名称不一致。",
+      "至少一条 Golden Answer（退款）包含当前知识库没有的事实，无法作为 evidence_first 的严格基准。",
+      "复合 case 只标 technical_login，却在同一请求中要求 billing 路由和工具，单标签意图评测会产生歧义。"
+    ]
+  },
+  "validated_checks": [
+    {
+      "check": "JSON 合法性",
+      "result": "pass",
+      "evidence": "目标文件可被 JSON 解析，根对象包含 dataset_name、dataset_version、knowledge_base_version、status、provenance、cases。"
+    },
+    {
+      "check": "阶段一数量和 case_id 唯一性",
+      "result": "pass",
+      "evidence": "cases 共 10 条，case_id 无重复；覆盖退款、订单、支付、账户安全、技术登录、技术崩溃、转人工、问候、越界和复合多轮场景。"
+    },
+    {
+      "check": "基础字段和嵌套 Golden 字段存在性",
+      "result": "pass_with_schema_gaps",
+      "evidence": "10 条 case 均有规范要求的基础字段、conversation、gold_intent、gold_route、gold_retrieval、gold_answer、gold_tools、gold_safety、evaluation；但见 findings 中工具、安全和人工标注缺口。"
+    },
+    {
+      "check": "意图枚举和 intent_group",
+      "result": "pass_with_oos_caveat",
+      "evidence": "数据中的 refund、order_status、payment_issue、account_security、technical_login、technical_crash、human_handoff、greeting、other 均存在于 IntentCategory；intent_recognizer.py 的 _INTENT_GROUPS 也能支持数据中的细粒度分组。out_of_scope 语义另见对应 finding。"
+    },
+    {
+      "check": "实体结构",
+      "result": "pass",
+      "evidence": "各 gold_intent.entities 使用 order_id、product、date、amount、error_code 五个键；复合 case 保留了 error_code=401 和 order_id=A1001。"
+    },
+    {
+      "check": "Golden Chunk 内容快照",
+      "result": "pass_with_mapping_gap",
+      "evidence": "6 个唯一逻辑 chunk 的声明 SHA-256 与对其 content 的 UTF-8 重新计算结果一致；退款、订单、账户安全和技术故障内容均能在 knowledge_base.py::_load_default_docs 的默认文档文字中找到。稳定定位缺口见 finding。"
+    },
+    {
+      "check": "重复与虚构政策",
+      "result": "pass_with_review",
+      "evidence": "case_id 无重复；payment case 明确标记当前 KB 无 payment_issue 文档，并禁止使用 technical_troubleshooting chunk，未直接编造支付政策。退款答案的额外 unsupported claim 仍需修正或补证。"
+    },
+    {
+      "check": "多轮记忆标注",
+      "result": "pass_with_composite_gaps",
+      "evidence": "composite.multiturn.001 保存了三轮真实顺序，并标注 must_retain=[error_code, order_id] 及 expected_summary_facts；其多意图和按子查询拆分检索的问题见 findings。"
+    }
+  ],
+  "findings": [
+    {
+      "case_id": "DATASET",
+      "affected_case_ids": [
+        "refund.single.001",
+        "order.single.001",
+        "payment.single.001",
+        "security.single.001",
+        "technical.login.001",
+        "technical.crash.001",
+        "handoff.single.001",
+        "composite.multiturn.001"
+      ],
+      "field": "evaluation.annotator_ids / evaluation.adjudicated / evaluation.confidence",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "所有含业务判断的 case 都是机器草稿：annotator_ids 为空、adjudicated=false、confidence=null；其中 payment、security、handoff、composite 等高风险 case 还未完成至少两名人工复核。",
+      "evidence": [
+        "目标文件 provenance.notes 明确写明数据尚未完成业务人工初标和高风险双人复核。",
+        "8 条工具/业务 case 的 evaluation.annotator_ids 均为空且 adjudicated=false。",
+        "规范第 10 节要求至少一名熟悉业务规则的人工初标，高风险 case 至少两人复核并由第三人仲裁。"
+      ],
+      "recommendation": "先完成业务人工初标；对 risk_level=high/critical 的 payment、security、handoff、composite 至少双人复核并记录仲裁结果，再将数据标记为可用于 Golden 评测。"
+    },
+    {
+      "case_id": "DATASET",
+      "affected_case_ids": [
+        "refund.single.001",
+        "order.single.001",
+        "payment.single.001",
+        "security.single.001",
+        "technical.login.001",
+        "technical.crash.001",
+        "composite.multiturn.001"
+      ],
+      "field": "gold_retrieval.gold_chunks / acceptable_chunks / must_not_use_chunks",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "Golden Chunk 的内容和哈希快照正确，但当前 KnowledgeBase 没有直接暴露数据集使用的稳定 document_id、chunk_id、content_hash 或 version。",
+      "evidence": [
+        "数据集使用如 refund_policy#chunk_001、technical_troubleshooting#chunk_001 的合成定位，并附带 version、valid_from 和 content_hash。",
+        "knowledge_base.py:88-95 写入 ChromaDB 的 metadata 只有 title、chunk_index、total_chunks，内部 id 是基于标题、序号和前 50 字符计算的 MD5。",
+        "knowledge_base.py:117-127 的 search 返回 title、content、score、chunk，不返回 document_id、chunk_id、content_hash 或 version。"
+      ],
+      "recommendation": "在知识库导入和 search 返回中保存并返回稳定 document_id/chunk_id/version/content_hash，或明确提供离线转换器和唯一匹配规则；在此之前不得把检索命中率报告为已可复现。"
+    },
+    {
+      "case_id": "DATASET",
+      "affected_case_ids": [
+        "refund.single.001",
+        "order.single.001",
+        "payment.single.001",
+        "security.single.001",
+        "technical.login.001",
+        "technical.crash.001",
+        "greeting.single.001",
+        "oos.single.001",
+        "composite.multiturn.001"
+      ],
+      "field": "gold_tools.*",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "数据集使用 search_knowledge_base 作为检索工具名，但允许审计的 KnowledgeBase 代码示例将 handler 注册为 knowledge_search；同一名称不一致会使工具选择和禁止工具评测失效。",
+      "evidence": [
+        "knowledge_base.py:7 将组件描述为 knowledge_search 工具的 handler。",
+        "knowledge_base.py:145-151 的 MCP 注册示例明确 name=\"knowledge_search\"。",
+        "数据集中 refund、order、security、technical.login、technical.crash、composite 将 search_knowledge_base 设为 required_tools；payment、greeting、oos 也在 forbidden_tools 中引用该名称。"
+      ],
+      "recommendation": "确认真实工具注册表的规范名称；统一数据集和实现，或在评测配置中显式声明 search_knowledge_base 到 knowledge_search 的别名映射，并保留版本化证据。"
+    },
+    {
+      "case_id": "DATASET",
+      "affected_case_ids": [
+        "refund.single.001",
+        "order.single.001",
+        "payment.single.001",
+        "security.single.001",
+        "technical.login.001",
+        "technical.crash.001",
+        "handoff.single.001",
+        "composite.multiturn.001"
+      ],
+      "field": "gold_tools",
+      "severity": "medium",
+      "needs_human_review": true,
+      "problem": "工具标注没有参数正确性和工具失败 fallback 字段；规范第 4.7 节要求这些维度，但当前 Canonical case 只记录工具集合和顺序。",
+      "evidence": [
+        "规范第 4.7 节要求参数是否正确、调用顺序以及工具失败时的预期 fallback。",
+        "上述 case 的 gold_tools 只有 required_tools、acceptable_tools、forbidden_tools、expected_tool_order，没有参数约束或失败 fallback。",
+        "允许审计的 KnowledgeBase 代码只能确认 search_handler 接收 query 和 top_k，无法确认 lookup_error_code、check_billing_fields、create_handoff_summary 等工具的参数契约。"
+      ],
+      "recommendation": "扩展 gold_tools 为按工具记录参数约束和 failure_fallback；补充真实工具注册/接口依据后，再启用参数和降级评测。"
+    },
+    {
+      "case_id": "DATASET",
+      "affected_case_ids": [
+        "refund.single.001",
+        "order.single.001",
+        "payment.single.001",
+        "security.single.001",
+        "technical.login.001",
+        "technical.crash.001",
+        "handoff.single.001",
+        "greeting.single.001",
+        "oos.single.001",
+        "composite.multiturn.001"
+      ],
+      "field": "gold_safety",
+      "severity": "medium",
+      "needs_human_review": true,
+      "problem": "风险标注没有把“必须有 KB 证据”“禁止固定承诺”“是否允许自动处理”等规范要求拆成独立字段，当前只能从 gold_answer.forbidden_claims 或 must_refuse_or_escalate 间接推断。",
+      "evidence": [
+        "规范第 4.8 节要求标注是否要求知识库证据、是否允许自动处理、风险触发原因以及敏感信息限制。",
+        "数据集 gold_safety 仅包含 must_refuse_or_escalate、must_not_request、pii_allowed_in_response、escalation_reason。"
+      ],
+      "recommendation": "增加 requires_kb_evidence、auto_processing_allowed、must_not_make_fixed_commitment 等显式字段，并规定 null 与 false 的差异。"
+    },
+    {
+      "case_id": "refund.single.001",
+      "field": "gold_answer.required_facts / reference_answers",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "退款参考答案和必答事实包含“具体时间以支付渠道为准/到账取决于支付渠道”，但当前退款政策 chunk 没有这条事实。",
+      "evidence": [
+        "数据集 refund_policy#chunk_001 的内容只说明审核 1-3 个工作日、审核通过后 5-7 个工作日退回原支付账户，没有支付渠道决定时效的句子。",
+        "knowledge_base.py:190-200 的退款政策默认文档同样只包含上述时限和原支付账户退回规则。",
+        "数据集 required_facts 将“不能保证立即到账”作为必答事实，reference_answer 还加入“具体时间以支付渠道为准”。"
+      ],
+      "recommendation": "二选一：删除该 unsupported claim 并按当前 KB 重写答案；或在新的知识库版本加入有业务依据的支付渠道时效规则并更新 content_hash/version。"
+    },
+    {
+      "case_id": "payment.single.001",
+      "field": "gold_retrieval.gold_chunks / task_types",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "该 case 标记了 retrieval，但 query_type 为 knowledge_not_available_in_current_kb 且没有 gold_chunks；这与阶段一“每个需要知识的 case 至少一个 gold_chunk”的验收条件存在冲突。",
+      "evidence": [
+        "目标文件 payment.single.001 的 task_types 包含 retrieval，gold_retrieval.gold_chunks 为空。",
+        "同 case 的 notes 明确说明当前 6 篇默认知识库没有 payment_issue 文档。",
+        "规范第 8 节要求每个需要知识的 case 至少有一个可映射 gold_chunk，但规范没有定义无证据 negative retrieval 的独立契约。"
+      ],
+      "recommendation": "明确该 case 是“检索无证据”的阴性对照：增加 per-query evidence_absent/expected_no_chunk 结构和评测规则；或者将其从需要 Golden Chunk 的 retrieval 集合拆出。"
+    },
+    {
+      "case_id": "security.single.001",
+      "field": "domain / gold_route.primary_agent / gold_route.acceptable_agents",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "账户安全 case 的 intent_group 是 account、风险为 critical，但 primary_agent 标为 billing，acceptable_agents 只有 billing 和 escalation；该路由缺少与账户安全的直接语义对应。",
+      "evidence": [
+        "数据集 security.single.001 的 gold_intent.intent=account_security、intent_group=account、domain=general。",
+        "同 case 的 gold_route.primary_agent=billing、acceptable_agents=[billing, escalation]、should_escalate=true。",
+        "intent_recognizer.py:118 将 account_security 映射到 account，而不是 billing；允许审计的文件中没有能证明 billing 是账户安全主 Agent 的路由实现。"
+      ],
+      "recommendation": "由业务和路由负责人复核主 Agent；若当前确实没有 account/security Agent，应明确“escalation 主处理、account 作为业务域”的降级规则，而不是把 billing 作为默认等价路由。"
+    },
+    {
+      "case_id": "security.single.001",
+      "field": "gold_intent.urgency",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "该 critical case 的 gold urgency=high，但当前 intent_recognizer 的 urgency 逻辑不会因 account_security 自动提升到 high；用户文本也没有当前代码识别的 high/critical urgency 关键词。",
+      "evidence": [
+        "用户文本为“我发现账户有异常登录，怎么办？”，不含今天、马上、尽快、紧急、立刻等当前关键词。",
+        "intent_recognizer.py:442-451 的 _urgency 只对关键词、ESCALATION/HUMAN_HANDOFF 和 COMPLAINT 做特殊处理，account_security 会落到 LOW。"
+      ],
+      "recommendation": "分离业务 risk_level 与运行时 urgency；若账户安全事件必须高优先级，增加明确的 account_security 风险升级规则，或将数据集 urgency 标注改为当前运行时可复现的值。"
+    },
+    {
+      "case_id": "technical.login.001",
+      "field": "task_types",
+      "severity": "medium",
+      "needs_human_review": true,
+      "problem": "task_types 包含 entity，但规范列出的 task_types 允许值为 intent、retrieval、generation、risk、route、dialog；entity 是 gold_intent 的子结构，不是规范中的 task_type。",
+      "evidence": [
+        "目标文件 technical.login.001 的 task_types=[intent, retrieval, generation, entity]。",
+        "规范第 4.1 节的 task_types 规则只列出 intent/retrieval/generation/risk/route/dialog。"
+      ],
+      "recommendation": "删除 entity，保留实体标注在 gold_intent.entities；或者先扩展规范和评测器的 task_types 枚举，再继续使用。"
+    },
+    {
+      "case_id": "greeting.single.001",
+      "field": "gold_answer.answer_policy",
+      "severity": "medium",
+      "needs_human_review": true,
+      "problem": "answer_policy=direct_answer 不在规范列出的 evidence_first、clarify_first、handoff_required、refuse 枚举中。",
+      "evidence": [
+        "目标文件 greeting.single.001:560 使用 answer_policy=direct_answer。",
+        "规范第 4.6 节列出的 answer_policy 选项没有 direct_answer；该 case 又明确是 no_retrieval_required。"
+      ],
+      "recommendation": "若 direct_answer 是必要的无检索策略，就把它加入规范和评测器枚举；不要把问候错误归入 evidence_first。"
+    },
+    {
+      "case_id": "oos.single.001",
+      "field": "scenario / gold_intent.intent / acceptable_intents",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "case 的场景明确是 out_of_scope，但 intent 只能使用 other；当前代码确实没有 out_of_scope 枚举，这会让越界 case 与普通 other 无法通过 intent 标签区分。",
+      "evidence": [
+        "目标文件将 scenario=out_of_scope，但 gold_intent.intent=other、acceptable_intents=[other]。",
+        "intent_recognizer.py:47-48 和 199、302 等位置显示当前 IntentCategory 没有 out_of_scope，未知输入会归为 OTHER。",
+        "规范阶段一同时要求覆盖 out_of_scope，且要求 out_of_scope 与 other 不混用。"
+      ],
+      "recommendation": "由业务确认兼容策略：优先新增 out_of_scope 枚举并独立评测；若暂时只能使用 other，必须在规范中正式写明 scenario=out_of_scope + intent=other 的兼容映射及单独统计规则。"
+    },
+    {
+      "case_id": "composite.multiturn.001",
+      "field": "task_types",
+      "severity": "medium",
+      "needs_human_review": true,
+      "problem": "复合多轮 case 同样包含未在规范枚举中的 entity task_type。",
+      "evidence": [
+        "目标文件 composite.multiturn.001 的 task_types 包含 dialog、entity；规范 task_types 允许值没有 entity。"
+      ],
+      "recommendation": "与 technical.login.001 一致：将实体作为 gold_intent.entities 评测，不把 entity 作为 task_type；或先扩展规范契约。"
+    },
+    {
+      "case_id": "composite.multiturn.001",
+      "field": "gold_intent.intent / acceptable_intents",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "用户请求同时包含 401 登录故障和疑似重复扣款，gold_intent 却只有 technical_login，acceptable_intents 也只有 technical_login；这会把明确的复合意图错误压成单标签。",
+      "evidence": [
+        "第三轮用户内容同时出现“错误码就是 401”“重复扣款”“订单号是 A1001”。",
+        "gold_route 又要求 primary_agent=technical、supporting_agents=[billing]，gold_tools 要求技术和账单三类工具。",
+        "规范规定无法唯一判断时应使用 acceptable_intents，并要求复合 case 覆盖辅助 Agent；当前意图标注没有表达 payment_issue。"
+      ],
+      "recommendation": "使用复合意图结构，或至少将 payment_issue 加入可接受集合并单独统计 ambiguity；保持 primary/supporting route 与意图标注的一致。"
+    },
+    {
+      "case_id": "composite.multiturn.001",
+      "field": "gold_retrieval",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "multi_query 只给了 technical_troubleshooting 一个 Golden Chunk，没有为重复扣款子查询表达“当前 KB 无证据”的期望，因此无法完整评估复合请求的召回、拒答和防虚构行为。",
+      "evidence": [
+        "gold_retrieval.query_type=multi_query，gold_documents 和 gold_chunks 只有 technical_troubleshooting。",
+        "gold_answer.required_facts 要求处理疑似重复扣款并收集账单字段，但当前默认 KB 没有 payment_issue 专门文档。",
+        "gold_retrieval.must_not_use_chunks 为空，未标注 billing 子查询的 evidence_absent 或禁止误用规则。"
+      ],
+      "recommendation": "拆成两个带 subquery_id 的检索标注：401 命中 technical chunk，重复扣款明确 expected_no_evidence；同时为每个子查询给出允许工具、禁止工具和 fallback。"
+    },
+    {
+      "case_id": "composite.multiturn.001",
+      "field": "gold_intent.urgency",
+      "severity": "high",
+      "needs_human_review": true,
+      "problem": "复合 case 的 gold urgency=high，但当前代码对 technical_login 不会因“重复扣款”和“401”自动提升 urgency；文本也没有当前关键词。",
+      "evidence": [
+        "当前会话文本没有紧急、马上、尽快、今天、立刻等 _URGENCY_KEYWORDS。",
+        "intent_recognizer.py:442-451 对 technical_login 没有专门提升逻辑，默认会返回 LOW。"
+      ],
+      "recommendation": "明确 urgency 是人工业务优先级还是当前识别器输出；若复合支付风险必须 high，应在风险规则中显式标注和实现，不能只在 Golden 中隐含。"
+    }
+  ],
+  "unverified_due_to_scope": [
+    {
+      "field": "gold_route.primary_agent / supporting_agents / acceptable_agents",
+      "needs_human_review": true,
+      "reason": "允许读取的 intent_recognizer.py 只定义意图和分组，没有 Agent 路由注册表或路由决策实现；billing、technical、general、escalation 是否为当前可用 Agent 无法独立确认。"
+    },
+    {
+      "field": "gold_tools 中除 KnowledgeBase handler 外的工具",
+      "needs_human_review": true,
+      "reason": "允许读取的两个源码文件没有 lookup_error_code、check_billing_fields、compare_amounts、build_diagnostic_plan、suggest_required_fields、create_handoff_summary 的注册和参数定义；报告未将其未经证实地判定为有效工具。"
+    }
+  ]
+}
