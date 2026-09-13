@@ -24,9 +24,26 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, parse_json_text
 
 logger = logging.getLogger(__name__)
+
+_RERANK_TOOL_NAME = "rerank_results"
+_RERANK_TOOL = {
+    "name": _RERANK_TOOL_NAME,
+    "description": "按与用户查询的相关性返回候选结果的完整排序，索引从 0 开始。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "order": {
+                "type": "array",
+                "items": {"type": "integer"},
+            },
+        },
+        "required": ["order"],
+        "additionalProperties": False,
+    },
+}
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
@@ -46,6 +63,7 @@ class ToolResult:
     cached:         bool = False
     latency_ms:     float = 0.0
     reranked:       bool = False   # 是否经过重排
+    rerank_degraded: bool = False  # 是否因重排失败回退到原始顺序
 
 
 @dataclass
@@ -141,7 +159,7 @@ class MCPToolManager:
         self._client = AsyncAnthropic(**kwargs)
         self._model  = model
         self._tools: Dict[str, Tool] = {}
-        self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
+        self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked, rerank_degraded)
 
     # ── 注册 / 注销 ───────────────────────────────────────────────────────────
 
@@ -177,7 +195,7 @@ class MCPToolManager:
         if use_cache and tool.cache_ttl > 0:
             cached = self._get_cache(name, params, cache_rerank_top_k)
             if cached is not None:
-                cached_data, cached_reranked = cached
+                cached_data, cached_reranked, cached_degraded = cached
                 tool.stats.total += 1
                 tool.stats.success += 1
                 return ToolResult(
@@ -186,6 +204,7 @@ class MCPToolManager:
                     tool_name=name,
                     cached=True,
                     reranked=cached_reranked,
+                    rerank_degraded=cached_degraded,
                 )
 
         # 熔断检查
@@ -209,16 +228,27 @@ class MCPToolManager:
 
             # 重排（针对返回列表的检索工具）
             reranked = False
+            rerank_degraded = False
             if rerank_top_k > 0 and tool.supports_rerank and isinstance(data, list):
                 query = params.get("query", "")
-                data, reranked = await self._rerank(query, data, rerank_top_k), True
+                data, rerank_degraded = await self._rerank_with_status(query, data, rerank_top_k)
+                reranked = len(data) > 0 and not rerank_degraded
 
             # 写缓存：缓存最终返回结果，避免下次命中未重排的原始结果。
             if tool.cache_ttl > 0:
-                self._set_cache(name, params, data, tool.cache_ttl, cache_rerank_top_k, reranked)
+                self._set_cache(
+                    name,
+                    params,
+                    data,
+                    tool.cache_ttl,
+                    cache_rerank_top_k,
+                    reranked,
+                    rerank_degraded,
+                )
 
             return ToolResult(success=True, data=data, tool_name=name,
-                              latency_ms=latency, reranked=reranked)
+                              latency_ms=latency, reranked=reranked,
+                              rerank_degraded=rerank_degraded)
 
         except asyncio.TimeoutError:
             tool.stats.failed += 1
@@ -293,17 +323,30 @@ class MCPToolManager:
         prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
 要求：每个子查询角度不同，覆盖原始问题的不同方面。
 原始查询: "{query}"
-返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
+返回 JSON 对象，例如: {{"queries": ["子查询1", "子查询2", "子查询3"]}}
+queries 必须是非空字符串数组，最多返回 {n} 条。不要返回其他字段。"""
         prompt = self._clean_text(prompt)
         try:
             resp = await self._client.messages.create(
                 model=self._model, max_tokens=256, temperature=0.3,
+                extra_body={
+                    "thinking": {"type": "disabled"},
+                    "response_format": {"type": "json_object"},
+                },
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = extract_text_content(resp.content)
             print(f"[DEBUG rewrite raw] {raw!r}", flush=True)
-            s, e = raw.find("["), raw.rfind("]") + 1
-            queries = json.loads(raw[s:e])
+            data = parse_json_text(raw)
+            queries = data.get("queries") if isinstance(data, dict) else None
+            if (
+                not isinstance(queries, list)
+                or not queries
+                or len(queries) > n
+                or any(not isinstance(item, str) or not item.strip() for item in queries)
+            ):
+                raise ValueError("查询改写结果必须是非空字符串数组，且不超过指定数量")
+            queries = [item.strip() for item in queries]
             # 原始查询也保留，去重
             return list(dict.fromkeys([query] + queries))
         except Exception as ex:
@@ -335,60 +378,153 @@ class MCPToolManager:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 3. 合并去重（按内容哈希去重）
-        seen, merged = set(), []
+        # 3. 合并去重：使用稳定的 Chunk 身份，不让 score 参与身份判断。
+        # 同一个 Chunk 被多个子查询命中时，保留 score 较高的代表项，
+        # 但该 score 只作为诊断信息，不作为跨子查询的最终排序依据。
+        merged_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        merged_order: List[Tuple[str, str]] = []
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
-                    if key not in seen:
-                        seen.add(key)
-                        merged.append(item)
+                    key = self._retrieval_item_key(item)
+                    if key is None:
+                        # 没有任何稳定身份信息时不强行合并，避免误删不同结果。
+                        merged_order.append(("unidentified", str(len(merged_order))))
+                        merged_by_key[merged_order[-1]] = item
+                        continue
+
+                    if key not in merged_by_key:
+                        merged_order.append(key)
+                        merged_by_key[key] = item
+                    elif self._item_score(item) > self._item_score(merged_by_key[key]):
+                        merged_by_key[key] = item
+
+        merged = [merged_by_key[key] for key in merged_order]
 
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
 
         # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
-        reranked = await self._rerank(query, merged, top_k)
-        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+        reranked, rerank_degraded = await self._rerank_with_status(query, merged, top_k)
+        return ToolResult(
+            success=True,
+            data=reranked,
+            tool_name=tool_name,
+            reranked=not rerank_degraded and len(merged) > top_k,
+            rerank_degraded=rerank_degraded,
+        )
+
+    @staticmethod
+    def _retrieval_item_key(item: Any) -> Optional[Tuple[str, str]]:
+        """返回不受 score 影响的检索结果身份。"""
+        if not isinstance(item, dict):
+            return None
+
+        for field in ("source_chunk_id", "content_hash", "runtime_id"):
+            value = item.get(field)
+            if value not in (None, ""):
+                return field, str(value)
+
+        content = item.get("content")
+        if content not in (None, ""):
+            return "content_hash", hashlib.sha256(str(content).encode()).hexdigest()
+
+        return None
+
+    @staticmethod
+    def _item_score(item: Any) -> float:
+        """读取 score 仅用于保留代表项，无法解析时不参与比较。"""
+        try:
+            return float(item.get("score"))
+        except (AttributeError, TypeError, ValueError):
+            return float("-inf")
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
     async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
+        """保持旧调用签名，只返回重排后的列表。"""
+        reranked, _ = await self._rerank_with_status(query, items, top_k)
+        return reranked
+
+    async def _rerank_with_status(
+        self,
+        query: str,
+        items: List[Any],
+        top_k: int,
+    ) -> Tuple[List[Any], bool]:
         """
         用 LLM 对召回结果重新打分排序。
 
         解决问题：向量检索的相似度分数不等于"对用户有用"，
         LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
+
+        返回值的第二项记录是否发生降级，避免把“返回了列表”误判为
+        “Rerank 成功”。
         """
         if len(items) <= top_k:
-            return items
+            return items, False
 
         # 将结果序列化为文本供 LLM 评分
         items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
                                for i, item in enumerate(items))
-        prompt = f"""根据用户查询，对以下检索结果按相关性打分（0-10），返回 JSON 数组。
+        prompt = f"""根据用户查询，对以下检索结果按相关性排序。
 用户查询: "{query}"
 检索结果:
 {items_text}
 
-返回格式（按相关性降序排列的索引列表）: [最相关的索引, ..., 最不相关的索引]
-只返回 JSON 数组，不要其他文字。"""
+请务必调用 rerank_results 工具，返回按相关性降序排列的完整索引列表。
+索引从 0 开始，必须包含每个候选结果恰好一次，不要遗漏或添加索引。"""
         prompt = self._clean_text(prompt)
 
         try:
             resp = await self._client.messages.create(
                 model=self._model, max_tokens=256, temperature=0.0,
+                tools=[_RERANK_TOOL],
+                tool_choice={"type": "tool", "name": _RERANK_TOOL_NAME},
+                extra_body={"thinking": {"type": "disabled"}},
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("["), raw.rfind("]") + 1
-            order: List[int] = json.loads(raw[s:e])
-            reranked = [items[i] for i in order if 0 <= i < len(items)]
-            return reranked[:top_k]
+            order = self._extract_rerank_order(resp.content)
+            if order is None:
+                raise ValueError(f"未收到有效的 {_RERANK_TOOL_NAME} 工具调用")
+            self._validate_rerank_order(order, len(items))
+            reranked = [items[i] for i in order]
+            return reranked[:top_k], False
         except Exception as ex:
             logger.warning(f"重排失败，返回原始顺序: {ex}")
-            return items[:top_k]
+            return items[:top_k], True
+
+    @staticmethod
+    def _extract_rerank_order(content: Any) -> Optional[List[Any]]:
+        """从 Anthropic 风格响应中提取指定工具调用的排序索引。"""
+        for block in content or []:
+            block_type = getattr(block, "type", None)
+            name = getattr(block, "name", None)
+            input_data = getattr(block, "input", None)
+            if isinstance(block, dict):
+                block_type = block.get("type", block_type)
+                name = block.get("name", name)
+                input_data = block.get("input", input_data)
+            if (
+                block_type == "tool_use"
+                and name == _RERANK_TOOL_NAME
+                and isinstance(input_data, dict)
+                and isinstance(input_data.get("order"), list)
+            ):
+                return input_data["order"]
+        return None
+
+    @staticmethod
+    def _validate_rerank_order(order: List[Any], item_count: int) -> None:
+        """拒绝不完整、重复或越界的排序，避免静默丢失候选结果。"""
+        if any(isinstance(index, bool) or not isinstance(index, int) for index in order):
+            raise ValueError("Rerank 返回的索引必须全部为整数")
+        expected = set(range(item_count))
+        actual = set(order)
+        if len(order) != item_count or actual != expected:
+            raise ValueError(
+                f"Rerank 返回的索引不是完整排列: expected={sorted(expected)}, received={order}"
+            )
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 
@@ -396,12 +532,17 @@ class MCPToolManager:
         payload = {"params": params, "rerank_top_k": rerank_top_k}
         return f"{name}:{hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()}"
 
-    def _get_cache(self, name: str, params: Dict, rerank_top_k: int = 0) -> Optional[Tuple[Any, bool]]:
+    def _get_cache(
+        self,
+        name: str,
+        params: Dict,
+        rerank_top_k: int = 0,
+    ) -> Optional[Tuple[Any, bool, bool]]:
         key = self._cache_key(name, params, rerank_top_k)
         if key in self._cache:
-            data, expire_at, reranked = self._cache[key]
+            data, expire_at, reranked, rerank_degraded = self._cache[key]
             if time.monotonic() < expire_at:
-                return data, reranked
+                return data, reranked, rerank_degraded
             del self._cache[key]
         return None
 
@@ -413,12 +554,18 @@ class MCPToolManager:
         ttl: float,
         rerank_top_k: int = 0,
         reranked: bool = False,
+        rerank_degraded: bool = False,
     ) -> None:
         if len(self._cache) >= 5000:
             # 清掉最旧的 1/4
             for k in list(self._cache)[:1250]:
                 del self._cache[k]
-        self._cache[self._cache_key(name, params, rerank_top_k)] = (data, time.monotonic() + ttl, reranked)
+        self._cache[self._cache_key(name, params, rerank_top_k)] = (
+            data,
+            time.monotonic() + ttl,
+            reranked,
+            rerank_degraded,
+        )
 
     # ── 参数校验 ──────────────────────────────────────────────────────────────
 

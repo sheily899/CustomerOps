@@ -25,7 +25,7 @@ import chromadb
 import redis.asyncio as redis
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, parse_json_text
 
 logger = logging.getLogger(__name__)
 
@@ -187,11 +187,14 @@ class MemoryManager:
         try:
             resp = await self._client.messages.create(
                 model=self._model, max_tokens=512, temperature=0.0,
+                extra_body={
+                    "thinking": {"type": "disabled"},
+                    "response_format": {"type": "json_object"},
+                },
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            profile_data = json.loads(raw[s:e])
+            profile_data = self._validate_profile_data(parse_json_text(raw))
 
             doc_id = self._profile_doc_id(user_id)
             doc_text = self._safe_text(json.dumps(profile_data, ensure_ascii=False))
@@ -215,6 +218,27 @@ class MemoryManager:
             logger.info(f"用户画像已更新: {user_id}")
         except Exception as ex:
             logger.warning(f"更新用户画像失败: {ex}")
+
+    @staticmethod
+    def _validate_profile_data(data: Any) -> Dict[str, Any]:
+        """校验画像 JSON 结构，避免把模型的任意对象写入长期记忆。"""
+        if not isinstance(data, dict):
+            raise ValueError("用户画像必须是 JSON 对象")
+
+        preferences = data.get("preferences")
+        entities = data.get("entities")
+        if not isinstance(preferences, list) or any(
+            not isinstance(item, str) for item in preferences
+        ):
+            raise ValueError("用户画像 preferences 必须是字符串数组")
+        if not isinstance(entities, dict):
+            raise ValueError("用户画像 entities 必须是对象")
+        for key, values in entities.items():
+            if not isinstance(key, str) or not isinstance(values, list) or any(
+                not isinstance(item, str) for item in values
+            ):
+                raise ValueError("用户画像 entities 的值必须是字符串数组")
+        return {"preferences": preferences, "entities": entities}
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 

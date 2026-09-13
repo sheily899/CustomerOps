@@ -84,6 +84,9 @@ services:
       - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
       - ECHOMIND_SKILLS_DIR=/app/skills
+      - ECHOMIND_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+      # 默认使用产品知识库；评测时可通过同名环境变量临时覆盖为 benchmark collection。
+      - ECHOMIND_KB_COLLECTION=${ECHOMIND_KB_COLLECTION:-knowledge_base_zh}
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval

@@ -49,6 +49,7 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_knowledge_base = None
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -66,7 +67,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _knowledge_base
 
     print(BANNER, flush=True)
 
@@ -127,7 +128,13 @@ async def lifespan(app: FastAPI):
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
     )
-    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
+    _knowledge_base = kb
+    logger.info(
+        "知识库已加载: %s 个文档片段，collection=%s，embedding_model=%s",
+        await kb.doc_count_async(),
+        kb.collection_name,
+        kb.embedding_model,
+    )
 
     def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
         query = params.get("query", "")
@@ -204,6 +211,20 @@ app.add_middleware(
 )
 
 
+def _ensure_utf8_json_content_type(response: Response) -> Response:
+    """明确声明 JSON 使用 UTF-8，兼容 Windows PowerShell 5.1 的响应解码。"""
+    content_type = response.headers.get("content-type", "")
+    if content_type.lower().startswith("application/json") and "charset=" not in content_type.lower():
+        response.headers["content-type"] = f"{content_type}; charset=utf-8"
+    return response
+
+
+@app.middleware("http")
+async def ensure_utf8_json_response(request, call_next):
+    response = await call_next(request)
+    return _ensure_utf8_json_content_type(response)
+
+
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message:     str
@@ -216,6 +237,7 @@ class ChatResponse(BaseModel):
     request_id:  str = ""
     response:    str
     intent:      str
+    secondary_intents: List[str] = Field(default_factory=list)
     intent_group: str = "other"
     agent_type:  str
     agent_types: List[str] = Field(default_factory=list)
@@ -225,11 +247,13 @@ class ChatResponse(BaseModel):
     routing_reason: str = ""
     routing_confidence: float = 0.0
     escalated:   bool
+    agent_recommended_handoff: bool = False
     latency_ms:  float
     knowledge_used: bool = False
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    intent_diagnostics: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolTraceResponse(BaseModel):
@@ -247,7 +271,18 @@ class RecentToolTracesResponse(BaseModel):
 async def health():
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
-    return {"status": "ok", "agents": _orchestrator.get_stats()}
+    knowledge_base = {}
+    if _knowledge_base is not None:
+        knowledge_base = {
+            "collection_name": _knowledge_base.collection_name,
+            "embedding_model": _knowledge_base.embedding_model,
+            "doc_count": await _knowledge_base.doc_count_async(),
+        }
+    return {
+        "status": "ok",
+        "agents": _orchestrator.get_stats(),
+        "knowledge_base": knowledge_base,
+    }
 
 
 @app.get("/skills", tags=["Skills"])
@@ -306,6 +341,9 @@ async def chat(req: ChatRequest):
         intent_group=intent_result.intent_group,
         urgency=intent_result.urgency,
         intent_confidence=intent_result.confidence,
+        intent_diagnostics=intent_result.diagnostics,
+        secondary_intents=list(intent_result.secondary_intents),
+        knowledge_required=_should_use_knowledge(req.message, intent=intent_result.intent),
     )
 
     # 3. 执行
@@ -323,6 +361,7 @@ async def chat(req: ChatRequest):
         request_id=result.request_id,
         response=result.response,
         intent=result.intent.value if result.intent else "other",
+        secondary_intents=[intent.value for intent in result.secondary_intents],
         intent_group=intent_result.intent_group,
         agent_type=result.agent_type.value,
         agent_types=[agent_type.value for agent_type in result.agent_types],
@@ -332,11 +371,13 @@ async def chat(req: ChatRequest):
         routing_reason=result.routing_reason,
         routing_confidence=result.routing_confidence,
         escalated=result.escalated,
+        agent_recommended_handoff=result.agent_recommended_handoff,
         latency_ms=round(result.latency_ms, 1),
         knowledge_used="search_knowledge_base" in result.tools_used,
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
+        intent_diagnostics=result.intent_diagnostics,
     )
 
 

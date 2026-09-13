@@ -197,6 +197,7 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
                 "error": getattr(result, "error", "知识库检索失败"),
                 "results": [],
                 "reranked": False,
+                "rerank_degraded": bool(getattr(result, "rerank_degraded", False)),
             }
 
         return {
@@ -205,6 +206,7 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
             "top_k": top_k,
             "results": result.data,
             "reranked": bool(getattr(result, "reranked", False)),
+            "rerank_degraded": bool(getattr(result, "rerank_degraded", False)),
         }
 
     return {

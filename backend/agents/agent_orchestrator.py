@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import deque
@@ -134,6 +135,11 @@ class Request:
     urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    intent_diagnostics: Dict[str, Any] = field(default_factory=dict)
+    # 仅由明确的跨域复合请求填充；单意图请求保持空数组。
+    secondary_intents: List[IntentCategory] = field(default_factory=list)
+    # 业务型请求的知识库门禁，由 API 层根据意图策略计算；不是评测集专用开关。
+    knowledge_required: bool = False
 
 
 @dataclass
@@ -143,6 +149,7 @@ class OrchestratorResult:
     agent_type:  AgentType
     intent:      Optional[IntentCategory]
     escalated:   bool  = False
+    agent_recommended_handoff: bool = False
     latency_ms:  float = 0.0
     agent_types: List[AgentType] = field(default_factory=list)
     primary_agent: Optional[AgentType] = None
@@ -151,6 +158,9 @@ class OrchestratorResult:
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
     routing_reason: str = ""
     routing_confidence: float = 0.0
+    intent_diagnostics: Dict[str, Any] = field(default_factory=dict)
+    secondary_intents: List[IntentCategory] = field(default_factory=list)
+    knowledge_required: bool = False
 
 
 @dataclass
@@ -201,6 +211,45 @@ class BaseAgent:
 
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._shared_tools = dict(tools or {})
+
+    def _retrieval_query(self, req: Request) -> str:
+        """为复合请求生成当前 Agent 的检索范围，不改变对话原文。
+
+        多 Agent 并行时，所有 Agent 共享同一条用户消息会让每个检索器都把
+        另一领域的诉求当成自己的关键词。只对已确认存在次意图的请求拆分；
+        单意图请求继续使用原始消息，避免改变普通请求行为。
+        """
+        message = (req.message or "").strip()
+        if not message or not req.secondary_intents:
+            return message
+
+        clauses = [
+            clause.strip(" ，,；;。！？!?：:")
+            for clause in re.split(
+                r"(?:，|,|；|;|。|！|!|？|\?|并且|同时|而且|另外|还要|以及)",
+                message,
+            )
+            if clause.strip(" ，,；;。！？!?：:")
+        ]
+        keyword_groups = {
+            AgentType.TECHNICAL: (
+                "崩溃", "报错", "错误", "error", "crash", "无法登录", "登录失败",
+                "登录", "401", "403", "500", "网络", "页面", "打不开", "加载", "请求",
+            ),
+            AgentType.BILLING: (
+                "退款", "退货", "发票", "账单", "支付", "扣款", "金额", "订阅", "invoice",
+            ),
+            AgentType.GENERAL: (
+                "订单", "物流", "快递", "配送", "地址", "会员", "积分", "投诉", "咨询",
+            ),
+        }
+        keywords = keyword_groups.get(self.agent_type, ())
+        scoped = [
+            clause
+            for clause in clauses
+            if any(keyword.casefold() in clause.casefold() for keyword in keywords)
+        ]
+        return "；".join(dict.fromkeys(scoped)) or message
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
@@ -255,6 +304,67 @@ class BaseAgent:
         tools = self.get_tools()
         tools_used: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
+
+        # 业务型请求不能把是否检索完全交给 Agent LLM 自主决定。
+        # 先执行一次确定性的知识库门禁，再把结果作为上下文交给 LLM；
+        # 同一 Agent 本轮不再重复暴露该工具，避免一次请求重复检索。
+        if req.knowledge_required:
+            search_spec = tools.get("search_knowledge_base")
+            if search_spec is None:
+                raise RuntimeError("当前 Agent 未配置必需的 search_knowledge_base 工具")
+
+            search_args = {"query": self._retrieval_query(req), "top_k": 5}
+            tool_t0 = time.monotonic()
+            call_success = True
+            result_success: Optional[bool] = None
+            error_text = ""
+            try:
+                self._validate_tool_input(search_spec, search_args)
+                forced_result = search_spec.handler(req, search_args)
+                if inspect.isawaitable(forced_result):
+                    forced_result = await forced_result
+                tools_used.append(search_spec.name)
+                if isinstance(forced_result, dict) and "success" in forced_result:
+                    result_success = bool(forced_result.get("success"))
+            except Exception as ex:
+                call_success = False
+                error_text = str(ex)
+                forced_result = {"success": False, "error": error_text, "results": []}
+                logger.warning("Agent 强制知识库检索失败: %s", ex)
+
+            if not isinstance(forced_result, dict):
+                forced_result = {"success": True, "results": forced_result}
+            if not error_text:
+                error_text = str(forced_result.get("error", "") or "")
+            tool_traces.append(
+                {
+                    "agent_type": self.agent_type.value,
+                    "tool_name": search_spec.name,
+                    "tool_use_id": f"forced_{uuid.uuid4().hex[:12]}",
+                    "input": dict(search_args),
+                    "success": call_success,
+                    "result_success": result_success,
+                    "latency_ms": round((time.monotonic() - tool_t0) * 1000, 1),
+                    "cached": bool(forced_result.get("cached", False)),
+                    "reranked": bool(forced_result.get("reranked", False)),
+                    "rerank_degraded": bool(forced_result.get("rerank_degraded", False)),
+                    "retrieved_chunks": forced_result.get("results", []),
+                    "error": error_text,
+                }
+            )
+            # 先写回实例状态，再调用 Agent LLM。若后续 LLM 失败或触发编排降级，
+            # 这次确定性检索的结果仍必须留在最终响应和 Trace 中。
+            self._last_tools_used = list(tools_used)
+            self._last_tool_traces = list(tool_traces)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "[系统已完成必需的知识库检索]\n"
+                    + json.dumps(forced_result, ensure_ascii=False),
+                }
+            )
+            tools.pop("search_knowledge_base", None)
+
         for _ in range(3):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
@@ -322,6 +432,7 @@ class BaseAgent:
                         "latency_ms": round(tool_latency_ms, 1),
                         "cached": bool(result.get("cached")) if isinstance(result, dict) else False,
                         "reranked": bool(result.get("reranked")) if isinstance(result, dict) else False,
+                        "rerank_degraded": bool(result.get("rerank_degraded")) if isinstance(result, dict) else False,
                         # 保留检索结果本身，供离线评测计算 Recall@K、Precision@K、MRR。
                         # 仅对 RAG 结果写入，避免把其他工具的完整输出混入 Trace。
                         "retrieved_chunks": result.get("results", []) if isinstance(result, dict) else [],
@@ -639,7 +750,6 @@ class AgentOrchestrator:
         IntentCategory.PAYMENT_ISSUE: AgentType.BILLING,
         IntentCategory.ACCOUNT:    AgentType.BILLING,
         IntentCategory.ACCOUNT_SECURITY: AgentType.BILLING,
-        IntentCategory.ESCALATION: AgentType.ESCALATION,
         IntentCategory.HUMAN_HANDOFF: AgentType.ESCALATION,
         # 其余意图 → GENERAL（默认）
     }
@@ -713,18 +823,89 @@ class AgentOrchestrator:
         return await self._intent_recognizer.recognize(message, history=history)
 
     def _record_tool_trace(self, result: OrchestratorResult) -> None:
+        retrieval_results = self._collect_retrieval_results(result.tool_traces)
+        retrieval_call_stages = []
+        for tool_trace in result.tool_traces:
+            if not isinstance(tool_trace, dict):
+                continue
+            if tool_trace.get("tool_name") not in {"search_knowledge_base", "knowledge_search"}:
+                continue
+            if tool_trace.get("rerank_degraded"):
+                stage = "degraded"
+            elif tool_trace.get("reranked"):
+                stage = "final_reranked"
+            else:
+                stage = "raw_or_unknown"
+            retrieval_call_stages.append({
+                "agent_type": tool_trace.get("agent_type", ""),
+                "stage": stage,
+                "reranked": bool(tool_trace.get("reranked")),
+                "rerank_degraded": bool(tool_trace.get("rerank_degraded")),
+            })
+        retrieval_stages = {item["stage"] for item in retrieval_call_stages}
+        if not retrieval_stages:
+            retrieval_stage = "not_used"
+        elif "degraded" in retrieval_stages:
+            retrieval_stage = "degraded"
+        elif len(retrieval_stages) > 1:
+            retrieval_stage = "mixed"
+        else:
+            retrieval_stage = next(iter(retrieval_stages))
         trace = {
             "request_id": result.request_id,
             "timestamp": datetime.now().isoformat(),
             "intent": result.intent.value if result.intent else None,
+            "intent_diagnostics": dict(result.intent_diagnostics),
+            "secondary_intents": [intent.value for intent in result.secondary_intents],
             "primary_agent": result.primary_agent.value if result.primary_agent else None,
             "supporting_agents": [agent.value for agent in result.supporting_agents],
+            "executed_agents": [agent.value for agent in result.agent_types],
+            "knowledge_required": result.knowledge_required,
             "tools_used": list(result.tools_used),
             "tool_calls": list(result.tool_traces),
+            # 供离线评测直接使用的最终去重结果。tool_calls 仍完整保留，
+            # 便于诊断 Query Rewrite、工具失败和多 Agent 调用过程。
+            "retrieval_stage": retrieval_stage,
+            "retrieval_call_stages": retrieval_call_stages,
+            "retrieval_results": retrieval_results,
             "escalated": result.escalated,
+            "agent_recommended_handoff": result.agent_recommended_handoff,
             "latency_ms": round(result.latency_ms, 1),
         }
         self._recent_tool_traces.append(trace)
+
+    @staticmethod
+    def _collect_retrieval_results(tool_traces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """合并检索工具的最终结果，按稳定 Chunk 身份去重并重排 rank。"""
+        rows: List[Dict[str, Any]] = []
+        seen = set()
+        for trace in tool_traces:
+            if not isinstance(trace, dict):
+                continue
+            if trace.get("tool_name") not in {"search_knowledge_base", "knowledge_search"}:
+                continue
+            for raw_item in trace.get("retrieved_chunks") or []:
+                if not isinstance(raw_item, dict):
+                    continue
+                identity = next(
+                    (
+                        f"{field}:{raw_item.get(field)}"
+                        for field in ("source_chunk_id", "content_hash", "runtime_id")
+                        if raw_item.get(field) not in (None, "")
+                    ),
+                    None,
+                )
+                if identity is None:
+                    content = raw_item.get("content")
+                    identity = f"content:{content}" if content not in (None, "") else None
+                if identity is not None and identity in seen:
+                    continue
+                if identity is not None:
+                    seen.add(identity)
+                item = dict(raw_item)
+                item["rank"] = len(rows) + 1
+                rows.append(item)
+        return rows
 
     def get_tool_trace(self, request_id: str) -> Optional[Dict[str, Any]]:
         for trace in reversed(self._recent_tool_traces):
@@ -754,6 +935,12 @@ class AgentOrchestrator:
             req.intent_group = intent_result.intent_group
             req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
+            req.intent_diagnostics = intent_result.diagnostics
+            req.secondary_intents = list(intent_result.secondary_intents)
+
+        if req.intent == IntentCategory.HUMAN_HANDOFF:
+            # 人工升级直接结束业务 Agent 路由；原始消息仍作为交接上下文保留。
+            req.secondary_intents = []
 
         if self._needs_clarification(req):
             result = OrchestratorResult(
@@ -767,6 +954,9 @@ class AgentOrchestrator:
                 primary_agent=AgentType.GENERAL,
                 routing_reason="低置信度 OTHER 意图，先澄清用户需求",
                 routing_confidence=req.intent_confidence,
+                intent_diagnostics=dict(req.intent_diagnostics),
+                secondary_intents=list(req.secondary_intents),
+                knowledge_required=req.knowledge_required,
             )
             self._record_tool_trace(result)
             return result
@@ -780,12 +970,10 @@ class AgentOrchestrator:
         response = await self._execute(req, decision.primary_agent)
 
         # 4. 升级检查
-        escalated = False
-        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent in (
-            IntentCategory.ESCALATION,
-            IntentCategory.HUMAN_HANDOFF,
-        ):
-            escalated = True
+        # response.escalate 只表示 Agent 在回复中建议人工，不等于已经执行转接。
+        # 最终升级决策只由用户明确的人工意图或强制紧急策略触发。
+        escalated = req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.HUMAN_HANDOFF
+        if escalated:
             logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
             # 生产环境：此处创建工单、通知人工客服
 
@@ -795,14 +983,18 @@ class AgentOrchestrator:
             agent_type=response.agent_type,
             intent=req.intent,
             escalated=escalated,
+            agent_recommended_handoff=response.escalate,
             latency_ms=(time.monotonic() - t0) * 1000,
             agent_types=[response.agent_type],
             primary_agent=decision.primary_agent,
-            supporting_agents=[],
+            supporting_agents=list(decision.supporting_agents),
             tools_used=list(response.tools_used),
             tool_traces=list(response.tool_traces),
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
+            intent_diagnostics=dict(req.intent_diagnostics),
+            secondary_intents=list(req.secondary_intents),
+            knowledge_required=req.knowledge_required,
         )
         self._record_tool_trace(result)
         return result
@@ -819,7 +1011,8 @@ class AgentOrchestrator:
 
         valid_responses = [r for r in responses if isinstance(r, AgentResponse)]
         combined = await self._composer.compose(req, valid_responses)
-        escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
+        agent_recommended_handoff = any(r.escalate for r in valid_responses)
+        escalated = req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.HUMAN_HANDOFF
         tools_used = list(dict.fromkeys(
             tool_name
             for response in valid_responses
@@ -836,6 +1029,7 @@ class AgentOrchestrator:
             agent_type=decision.primary_agent,
             intent=req.intent,
             escalated=escalated,
+            agent_recommended_handoff=agent_recommended_handoff,
             latency_ms=(time.monotonic() - t0) * 1000,
             agent_types=[
                 r.agent_type for r in responses
@@ -847,6 +1041,9 @@ class AgentOrchestrator:
             tool_traces=tool_traces,
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
+            intent_diagnostics=dict(req.intent_diagnostics),
+            secondary_intents=list(req.secondary_intents),
+            knowledge_required=req.knowledge_required,
         )
         self._record_tool_trace(result)
         return result
@@ -881,13 +1078,15 @@ class AgentOrchestrator:
         if req.urgency == UrgencyLevel.CRITICAL:
             return RoutingDecision(
                 primary_agent=AgentType.ESCALATION,
+                supporting_agents=[],
                 reason="紧急度为 CRITICAL，触发升级路由",
                 confidence=1.0,
             )
 
-        if req.intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
+        if req.intent == IntentCategory.HUMAN_HANDOFF:
             return RoutingDecision(
                 primary_agent=AgentType.ESCALATION,
+                supporting_agents=[],
                 reason=f"意图为 {req.intent.value if req.intent else 'unknown'}，触发升级路由",
                 confidence=max(req.intent_confidence, 0.8),
             )
@@ -907,11 +1106,9 @@ class AgentOrchestrator:
 
         ordered = sorted(available_scores.items(), key=lambda item: item[1], reverse=True)
         primary_agent, primary_score = ordered[0]
-        supporting_agents = [
-            agent_type
-            for agent_type, score in ordered[1:]
-            if agent_type != AgentType.GENERAL and score >= 0.45 and score >= primary_score * 0.55
-        ]
+        # 辅助 Agent 只接受识别器明确给出的跨域 secondary_intents，不能再
+        # 因为一条消息里偶然出现两个领域关键词就自动并行，避免污染单意图请求。
+        supporting_agents = self._secondary_agent_types(req, primary_agent=primary_agent)
 
         reason = self._routing_reason(req, available_scores, primary_agent, supporting_agents)
         return RoutingDecision(
@@ -920,6 +1117,28 @@ class AgentOrchestrator:
             reason=reason,
             confidence=round(min(primary_score, 1.0), 3),
         )
+
+    def _secondary_agent_types(
+        self,
+        req: Request,
+        primary_agent: Optional[AgentType] = None,
+    ) -> List[AgentType]:
+        """把已确认的次意图映射为辅助 Agent，不重新从原文猜测复合请求。"""
+        primary_agent = primary_agent or (
+            self._INTENT_ROUTING.get(req.intent, AgentType.GENERAL)
+            if req.intent is not None
+            else None
+        )
+        agents: List[AgentType] = []
+        for intent in req.secondary_intents:
+            agent_type = self._INTENT_ROUTING.get(intent, AgentType.GENERAL)
+            if agent_type == AgentType.ESCALATION or agent_type == primary_agent:
+                continue
+            if not self._pool.get(agent_type):
+                continue
+            if agent_type not in agents:
+                agents.append(agent_type)
+        return agents
 
     def _domain_scores(self, req: Request) -> Dict[AgentType, float]:
         """按意图、关键词和实体为各领域 Agent 打分。"""
@@ -994,9 +1213,11 @@ class AgentOrchestrator:
         )
         support_text = ", ".join(agent.value for agent in supporting_agents) or "none"
         intent = req.intent.value if req.intent else "unknown"
+        secondary_text = ", ".join(intent.value for intent in req.secondary_intents) or "none"
         return (
             f"intent={intent}, group={req.intent_group or 'unknown'}, "
-            f"primary={primary_agent.value}, supporting={support_text}, scores=[{score_text}]"
+            f"secondary={secondary_text}, primary={primary_agent.value}, "
+            f"supporting={support_text}, scores=[{score_text}]"
         )
 
     def _collaboration_targets(self, req: Request) -> List[AgentType]:

@@ -14,6 +14,7 @@ ChromaDB 在这里的角色：
 import asyncio
 import hashlib
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -21,24 +22,52 @@ import chromadb
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+DEFAULT_COLLECTION_NAME = "knowledge_base_zh"
+LEGACY_COLLECTION_NAME = "knowledge_base"
+
+
+def build_embedding_function(model_name: str):
+    """构建客户端 Embedding 函数，确保文档和查询使用同一个中文模型。"""
+    from chromadb.utils import embedding_functions
+
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=model_name,
+        device="cpu",
+        normalize_embeddings=True,
+    )
+
+
 class KnowledgeBase:
     """
     基于 ChromaDB 的 RAG 知识库。
 
-    ChromaDB 内置了 Embedding 模型（all-MiniLM-L6-v2），
-    调用 add() 时自动生成向量，query() 时自动做语义匹配。
-    不需要额外调用 Anthropic Embeddings API。
+    使用中文 Embedding 模型 BAAI/bge-small-zh-v1.5。
+    文档导入和查询都通过同一个客户端 Embedding 函数生成向量，
+    避免中文查询与文档向量使用不同模型。
     """
 
-    COLLECTION_NAME = "knowledge_base"
+    # 保留类级常量供旧代码读取；实际名称可通过 ECHOMIND_KB_COLLECTION 覆盖。
+    COLLECTION_NAME = DEFAULT_COLLECTION_NAME
 
     def __init__(
         self,
         chroma_host: str = "localhost",
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
+        embedding_model: Optional[str] = None,
+        collection_name: Optional[str] = None,
+        load_defaults: bool = True,
     ):
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
+        self.embedding_model = (
+            embedding_model or os.getenv("ECHOMIND_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+        ).strip()
+        self.collection_name = (
+            collection_name or os.getenv("ECHOMIND_KB_COLLECTION", DEFAULT_COLLECTION_NAME)
+        ).strip()
+        self._embedding_function = build_embedding_function(self.embedding_model)
+
+        # 优先连接独立 ChromaDB 服务；Embedding 在应用侧生成后写入/查询服务端。
         self._use_server = False
         try:
             # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
@@ -57,73 +86,157 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
+        # 显式传入 Embedding 函数，服务端和本地模式都使用同一个中文模型。
         self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 知识库"},
+            name=self.collection_name,
+            metadata={
+                "description": "EchoMind RAG 知识库",
+                "embedding_model": self.embedding_model,
+                "hnsw:space": "l2",
+            },
+            embedding_function=self._embedding_function,
         )
 
-        # 如果知识库为空，导入默认文档
-        if self._collection.count() == 0:
-            self._load_default_docs()
+        # 新集合为空时，优先迁移旧集合中的文档并用新模型重新生成向量。
+        # 评测集合可显式关闭自动初始化，避免默认文档混入测试语料。
+        if load_defaults and self._collection.count() == 0:
+            self._migrate_legacy_docs_or_load_defaults()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
-    def add_documents(self, documents: List[Dict[str, str]]) -> int:
+    def add_documents(self, documents: List[Dict[str, Any]]) -> int:
         """
         批量导入文档到知识库。
 
         documents 格式: [{"title": "...", "content": "..."}, ...]
+        可选的 source_document_id / corpus_version 会写入每个 chunk 的 metadata，
+        用于评测时跨运行稳定地标识来源。
         长文档会自动切片（每片 500 字）。
         """
         ids, docs, metas = [], [], []
 
         for doc in documents:
-            title   = doc.get("title", "")
+            title = doc.get("title", "")
             content = doc.get("content", "")
-            chunks  = self._chunk_text(content, chunk_size=500)
+            source_document_id = doc.get("source_document_id") or self._slugify(title)
+            corpus_version = doc.get("corpus_version") or "kb-v1-default"
+            chunks = self._chunk_text(content, chunk_size=500)
 
             for i, chunk in enumerate(chunks):
                 doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
                 ids.append(doc_id)
                 docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+                metas.append(
+                    {
+                        "title": title,
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                        "source_document_id": source_document_id,
+                        # 对外稳定 ID 从 001 开始；runtime_id 仍保留 Chroma 的实际 ID。
+                        "source_chunk_id": f"{source_document_id}#chunk_{i + 1:03d}",
+                        "content_hash": f"sha256:{hashlib.sha256(chunk.encode()).hexdigest()}",
+                        "corpus_version": corpus_version,
+                    }
+                )
 
         if ids:
-            # ChromaDB 会自动生成 Embedding
+            # 由显式配置的中文 Embedding 函数生成向量。
             self._collection.add(ids=ids, documents=docs, metadatas=metas)
             logger.info(f"知识库导入 {len(ids)} 个文档片段")
 
         return len(ids)
 
-    async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
+    async def add_documents_async(self, documents: List[Dict[str, Any]]) -> int:
         """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
         return await asyncio.to_thread(self.add_documents, documents)
+
+    def add_chunks(self, chunks: List[Dict[str, Any]]) -> int:
+        """导入已经冻结的 chunk，并保留其 source_chunk_id。"""
+        ids, docs, metas = [], [], []
+
+        for chunk in chunks:
+            source_chunk_id = str(chunk.get("source_chunk_id") or "").strip()
+            content = str(chunk.get("content") or "")
+            if not source_chunk_id or not content:
+                raise ValueError("冻结 chunk 必须包含 source_chunk_id 和 content")
+
+            source_document_id = str(
+                chunk.get("source_document_id")
+                or source_chunk_id.split("#chunk_", 1)[0]
+            )
+            suffix = source_chunk_id.rsplit("#chunk_", 1)[-1]
+            try:
+                chunk_index = int(suffix) - 1 if suffix.isdigit() else int(chunk.get("chunk_index", 0))
+            except (TypeError, ValueError):
+                chunk_index = 0
+            content_hash = str(chunk.get("content_hash") or "")
+            if not content_hash:
+                content_hash = f"sha256:{hashlib.sha256(content.encode()).hexdigest()}"
+            corpus_version = str(chunk.get("corpus_version") or "kb-v1-default")
+            runtime_id = hashlib.md5(
+                f"{source_chunk_id}\n{content_hash}".encode()
+            ).hexdigest()
+
+            ids.append(runtime_id)
+            docs.append(content)
+            metas.append(
+                {
+                    "title": str(chunk.get("title") or ""),
+                    "chunk_index": chunk_index,
+                    "total_chunks": int(chunk.get("total_chunks") or 1),
+                    "source_document_id": source_document_id,
+                    "source_chunk_id": source_chunk_id,
+                    "content_hash": content_hash,
+                    "corpus_version": corpus_version,
+                }
+            )
+
+        if ids:
+            self._collection.add(ids=ids, documents=docs, metadatas=metas)
+            logger.info("知识库导入 %s 个冻结文档片段", len(ids))
+        return len(ids)
+
+    async def add_chunks_async(self, chunks: List[Dict[str, Any]]) -> int:
+        """异步导入已经冻结的 chunk。"""
+        return await asyncio.to_thread(self.add_chunks, chunks)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """
         语义检索：根据 query 返回最相关的文档片段。
 
-        ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
+        ChromaDB 使用同一个中文 Embedding 函数将 query 转为向量，再进行 L2 检索。
         """
         results = self._collection.query(
             query_texts=[query],
             n_results=top_k,
+            include=["documents", "metadatas", "distances"],
         )
 
         items = []
         if results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
+            documents = results["documents"][0]
+            metadatas = (results.get("metadatas") or [[]])[0]
+            distances = (results.get("distances") or [[]])[0]
+            ids = (results.get("ids") or [[]])[0]
+            if not ids:
+                ids = [""] * len(documents)
+            for runtime_id, doc, meta, dist in zip(
+                ids,
+                documents,
+                metadatas,
+                distances,
             ):
+                meta = meta or {}
                 items.append({
                     "title":    meta.get("title", ""),
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),
+                    "runtime_id": runtime_id,
+                    "source_document_id": meta.get("source_document_id", ""),
+                    "source_chunk_id": meta.get("source_chunk_id", ""),
+                    "content_hash": meta.get("content_hash", ""),
+                    "corpus_version": meta.get("corpus_version", ""),
                 })
 
         return items
@@ -157,6 +270,14 @@ class KnowledgeBase:
         return await self.search_async(query, top_k=top_k)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _slugify(title: str) -> str:
+        """为未显式提供来源 ID 的旧调用生成可读的稳定兜底 ID。"""
+        import re
+
+        value = re.sub(r"[^\w\u4e00-\u9fff]+", "_", title.strip())
+        return value.strip("_") or "doc"
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
         """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""
@@ -258,3 +379,28 @@ class KnowledgeBase:
         ]
         self.add_documents(default_docs)
         logger.info(f"已导入默认知识库: {len(default_docs)} 篇文档")
+
+    def _migrate_legacy_docs_or_load_defaults(self) -> None:
+        """将旧默认集合的文档迁移到中文集合，避免切换模型后丢失已有知识。"""
+        try:
+            legacy = self._client.get_collection(name=LEGACY_COLLECTION_NAME)
+            legacy_data = legacy.get(include=["documents", "metadatas"])
+            ids = legacy_data.get("ids", [])
+            documents = legacy_data.get("documents", [])
+            metadatas = legacy_data.get("metadatas", [])
+            if ids and documents:
+                payload: Dict[str, Any] = {"ids": ids, "documents": documents}
+                if metadatas:
+                    payload["metadatas"] = metadatas
+                self._collection.add(**payload)
+                logger.info(
+                    "已将旧知识库迁移到中文 Embedding 集合: %s -> %s，共 %s 个文档片段",
+                    LEGACY_COLLECTION_NAME,
+                    self.collection_name,
+                    len(documents),
+                )
+                return
+        except Exception as exc:
+            logger.info("未找到可迁移的旧知识库，使用默认文档初始化: %s", exc)
+
+        self._load_default_docs()

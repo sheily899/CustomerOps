@@ -1,12 +1,15 @@
 import asyncio
+from collections import deque
 
 from agents.agent_orchestrator import (
     AgentProfile,
     AgentResponse,
     AgentType,
+    AgentOrchestrator,
     BillingAgent,
     EscalationAgent,
     GeneralAgent,
+    OrchestratorResult,
     Request,
     ResponseComposer,
     RoutingDecision,
@@ -201,3 +204,93 @@ def test_tool_use_round_trip_executes_only_whitelisted_tool():
         "build_diagnostic_plan",
     }
     assert "tool_result" in str(client.calls[1]["messages"])
+
+
+def test_tool_trace_exposes_deduplicated_final_retrieval_results():
+    orchestrator = AgentOrchestrator.__new__(AgentOrchestrator)
+    orchestrator._recent_tool_traces = deque(maxlen=10)
+    result = OrchestratorResult(
+        request_id="trace-1",
+        response="回答",
+        agent_type=AgentType.BILLING,
+        intent=IntentCategory.REFUND,
+        primary_agent=AgentType.BILLING,
+        tools_used=["search_knowledge_base"],
+        tool_traces=[
+            {
+                "tool_name": "search_knowledge_base",
+                "reranked": True,
+                "retrieved_chunks": [
+                    {"source_chunk_id": "chunk-a", "title": "A"},
+                    {"source_chunk_id": "chunk-b", "title": "B"},
+                ],
+            },
+            {
+                "tool_name": "search_knowledge_base",
+                "reranked": True,
+                "retrieved_chunks": [
+                    {"source_chunk_id": "chunk-a", "title": "A duplicate"},
+                    {"source_chunk_id": "chunk-c", "title": "C"},
+                ],
+            },
+        ],
+    )
+
+    orchestrator._record_tool_trace(result)
+
+    trace = orchestrator.get_tool_trace("trace-1")
+    assert trace["retrieval_stage"] == "final_reranked"
+    assert [item["source_chunk_id"] for item in trace["retrieval_results"]] == [
+        "chunk-a",
+        "chunk-b",
+        "chunk-c",
+    ]
+    assert [item["rank"] for item in trace["retrieval_results"]] == [1, 2, 3]
+
+
+def _make_run_orchestrator(response):
+    orchestrator = AgentOrchestrator.__new__(AgentOrchestrator)
+    orchestrator._needs_clarification = lambda req: False
+    orchestrator._route_decision = lambda req: RoutingDecision(
+        primary_agent=AgentType.BILLING,
+    )
+
+    async def execute(req, agent_type):
+        return response
+
+    orchestrator._execute = execute
+    orchestrator._record_tool_trace = lambda result: None
+    return orchestrator
+
+
+def test_agent_recommendation_does_not_count_as_completed_handoff():
+    orchestrator = _make_run_orchestrator(AgentResponse(
+        agent_type=AgentType.BILLING,
+        content="如果仍未到账，建议转人工核验。",
+        success=True,
+        escalate=True,
+    ))
+
+    result = asyncio.run(orchestrator.run(make_request(
+        intent=IntentCategory.REFUND,
+        urgency=UrgencyLevel.LOW,
+    )))
+
+    assert result.escalated is False
+    assert result.agent_recommended_handoff is True
+
+
+def test_explicit_handoff_intent_still_escalates():
+    orchestrator = _make_run_orchestrator(AgentResponse(
+        agent_type=AgentType.ESCALATION,
+        content="已收到人工请求。",
+        success=True,
+        escalate=False,
+    ))
+
+    result = asyncio.run(orchestrator.run(make_request(
+        intent=IntentCategory.HUMAN_HANDOFF,
+        urgency=UrgencyLevel.HIGH,
+    )))
+
+    assert result.escalated is True

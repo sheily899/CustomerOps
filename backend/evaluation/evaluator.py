@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, parse_json_text
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
 
@@ -126,16 +126,31 @@ Agent 响应: {response}
         try:
             resp = await self._client.messages.create(
                 model=self._model, max_tokens=256, temperature=0.0,
+                extra_body={
+                    "thinking": {"type": "disabled"},
+                    "response_format": {"type": "json_object"},
+                },
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            data = json.loads(raw[s:e])
+            data = parse_json_text(raw)
+            if not isinstance(data, dict):
+                raise ValueError("LLM Judge 返回结果必须是 JSON 对象")
+
+            values: Dict[str, float] = {}
+            for field_name in ("relevance", "accuracy", "completeness", "helpfulness"):
+                value = data.get(field_name)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(f"LLM Judge 字段 {field_name} 不是数字")
+                value = float(value)
+                if not 0.0 <= value <= 1.0:
+                    raise ValueError(f"LLM Judge 字段 {field_name} 超出范围: {value}")
+                values[field_name] = value
             return QualityScores(
-                relevance=float(data.get("relevance", 0.5)),
-                accuracy=float(data.get("accuracy", 0.5)),
-                completeness=float(data.get("completeness", 0.5)),
-                helpfulness=float(data.get("helpfulness", 0.5)),
+                relevance=values["relevance"],
+                accuracy=values["accuracy"],
+                completeness=values["completeness"],
+                helpfulness=values["helpfulness"],
             )
         except Exception as ex:
             logger.warning(f"LLM Judge 失败: {ex}")
@@ -286,6 +301,10 @@ class EndToEndEvaluator:
                 case_results = await self._evaluate_dialog_case(case, i)
                 results.extend(case_results)
                 for r in case_results:
+                    # Judge 失败时的 0.5 是占位值，只保留在逐案例结果中，
+                    # 不得混入正常质量均值，避免把“评测失败”伪装成中等质量。
+                    if r.metadata.get("judge_failed"):
+                        continue
                     for k in all_scores:
                         if k in r.scores:
                             all_scores[k].append(r.scores[k])

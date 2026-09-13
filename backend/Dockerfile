@@ -12,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONPATH=/app
 
-# curl 用于健康检查；不再需要 gcc/g++（已移除本地 ML 模型）
+# curl 用于健康检查；Embedding 使用预编译 CPU 包，不需要 gcc/g++。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
@@ -22,7 +22,11 @@ FROM base AS dependencies
 
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.4.1+cpu && \
     pip install -r requirements.txt
+
+# 预下载中文 Embedding 模型，避免首次启动时联网下载。
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-zh-v1.5')"
 
 # 预下载 ChromaDB 内置的 ONNX embedding 模型（~79MB），避免运行时下载超时
 RUN mkdir -p /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2 && \
@@ -43,6 +47,8 @@ COPY --from=dependencies /usr/local/lib/python3.12/site-packages /usr/local/lib/
 COPY --from=dependencies /usr/local/bin /usr/local/bin
 # 复制预下载的 ONNX 模型缓存
 COPY --from=dependencies --chown=echomind:echomind /root/.cache/chroma /home/echomind/.cache/chroma
+# 复制预下载的 Hugging Face 模型缓存
+COPY --from=dependencies --chown=echomind:echomind /root/.cache/huggingface /home/echomind/.cache/huggingface
 
 # 复制应用代码
 COPY --chown=echomind:echomind . .

@@ -21,8 +21,6 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
-
 logger = logging.getLogger(__name__)
 
 
@@ -31,7 +29,6 @@ class IntentCategory(Enum):
     COMPLAINT  = "complaint"   # 投诉不满
     REQUEST    = "request"     # 请求操作
     GREETING   = "greeting"    # 问候
-    ESCALATION = "escalation"  # 要求升级/转人工
     TECHNICAL  = "technical"   # 技术问题
     BILLING    = "billing"     # 账单/退款
     ACCOUNT    = "account"     # 账户管理
@@ -45,7 +42,13 @@ class IntentCategory(Enum):
     TECHNICAL_LOGIN = "technical_login"  # 登录认证故障
     TECHNICAL_CRASH = "technical_crash"  # 崩溃/错误码
     HUMAN_HANDOFF = "human_handoff"      # 转人工
+    ESCALATION = "human_handoff"         # 旧版意图值的兼容别名
     OTHER      = "other"
+
+
+_INTENT_ALIASES = {
+    "escalation": "human_handoff",
+}
 
 
 class UrgencyLevel(Enum):
@@ -65,6 +68,42 @@ class IntentResult:
     reasoning:  str
     latency_ms: float
     source_scores: Dict[str, float] = field(default_factory=dict)
+    source_intents: Dict[str, str] = field(default_factory=dict)
+    # 默认为空；只有独立复合诉求通过第二阶段规则时才填充。
+    secondary_intents: List[IntentCategory] = field(default_factory=list)
+    compound_trigger: str = ""
+
+    @property
+    def diagnostics(self) -> Dict[str, Any]:
+        """返回仅用于诊断的三路识别结果，不参与路由或投票。"""
+        source_names = ("llm", "embedding", "pattern")
+        sources = {
+            name: {
+                "intent": self.source_intents.get(name, IntentCategory.OTHER.value),
+                "confidence": round(float(self.source_scores.get(name, 0.0) or 0.0), 4),
+            }
+            for name in source_names
+        }
+        extra_scores = {
+            key: round(float(value), 4)
+            for key, value in self.source_scores.items()
+            if key not in source_names
+        }
+        payload: Dict[str, Any] = {
+            "sources": sources,
+            "final": {
+                "intent": self.intent.value,
+                "confidence": round(float(self.confidence), 4),
+            },
+            "compound": {
+                "detected": bool(self.secondary_intents),
+                "secondary_intents": [intent.value for intent in self.secondary_intents],
+                "trigger": self.compound_trigger,
+            },
+        }
+        if extra_scores:
+            payload["adjustments"] = extra_scores
+        return payload
 
 
 # ── Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）────────────────────────
@@ -73,7 +112,6 @@ _TEMPLATES: Dict[IntentCategory, List[str]] = {
     IntentCategory.COMPLAINT:  ["等了好几个小时！", "服务太差了！", "一直没人处理！"],
     IntentCategory.REQUEST:    ["帮我取消订单", "我需要修改地址", "请协助退款"],
     IntentCategory.GREETING:   ["你好", "嗨，有人吗", "早上好"],
-    IntentCategory.ESCALATION: ["我要投诉！", "转人工客服", "找你们经理"],
     IntentCategory.TECHNICAL:  ["应用一直崩溃", "无法登录", "出现500错误"],
     IntentCategory.BILLING:    ["为什么扣了两次款？", "申请退款", "发票问题"],
     IntentCategory.ACCOUNT:    ["修改邮箱", "注销账户", "更新个人信息"],
@@ -106,7 +144,6 @@ _GENERIC_INTENTS = {
     IntentCategory.BILLING,
     IntentCategory.TECHNICAL,
     IntentCategory.ACCOUNT,
-    IntentCategory.ESCALATION,
 }
 
 _INTENT_GROUPS: Dict[IntentCategory, IntentCategory] = {
@@ -118,7 +155,6 @@ _INTENT_GROUPS: Dict[IntentCategory, IntentCategory] = {
     IntentCategory.ACCOUNT_SECURITY: IntentCategory.ACCOUNT,
     IntentCategory.TECHNICAL_LOGIN: IntentCategory.TECHNICAL,
     IntentCategory.TECHNICAL_CRASH: IntentCategory.TECHNICAL,
-    IntentCategory.HUMAN_HANDOFF: IntentCategory.ESCALATION,
 }
 
 # 紧急关键词
@@ -127,6 +163,85 @@ _URGENCY_KEYWORDS = {
     UrgencyLevel.HIGH:     ["今天", "马上", "尽快", "hurry", "now"],
     UrgencyLevel.MEDIUM:   ["这周", "soon", "快点"],
 }
+
+_INTENT_TOOL_NAME = "classify_intent"
+_INTENT_TOOL = {
+    "name": _INTENT_TOOL_NAME,
+    "description": "根据用户消息返回一个客服意图及其置信度。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "intent": {
+                "type": "string",
+                "enum": [category.value for category in IntentCategory],
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+            },
+            "reasoning": {"type": "string"},
+        },
+        "required": ["intent", "confidence"],
+        "additionalProperties": False,
+    },
+}
+
+# 复合请求只在出现明确的分句/连接信号时才进入第二阶段判断。
+# 单个词同时出现并不等于两个独立诉求，例如“退款页面打不开”仍可只是
+# 退款流程中的一个技术现象，不能仅凭关键词把它拆成两个意图。
+_COMPOUND_STRONG_TRIGGER_RE = re.compile(
+    r"(?:同时|另外|还想|还要|而且|并且|此外|分别|两个问题|两个诉求|除此之外|但是|不过|以及)"
+)
+_HANDOFF_TRIGGER_RE = re.compile(
+    r"(?:转人工|人工客服|人工处理|人工介入|升级人工|找人工)"
+)
+_COMPOUND_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:同时|另外|还想|还要|而且|并且|此外|分别|两个问题|两个诉求|除此之外|但是|不过|以及|[，,；;\n。！？!?])"
+)
+
+# 这里只用于复合检测，不改变现有三路主意图投票的关键词口径。
+# 每个候选意图只承担一个可独立识别的业务主题。
+_COMPOUND_PATTERNS: Dict[IntentCategory, List[str]] = {
+    IntentCategory.HUMAN_HANDOFF: ["转人工", "人工客服", "人工处理", "人工介入", "升级人工", "找人工"],
+    IntentCategory.ORDER_STATUS: ["订单状态", "订单进展", "处理到哪", "订单有没有发货"],
+    IntentCategory.LOGISTICS: ["物流", "快递", "配送", "运单"],
+    IntentCategory.REFUND: ["退款", "退货", "refund", "return"],
+    IntentCategory.INVOICE: ["发票", "抬头", "税号", "invoice"],
+    IntentCategory.PAYMENT_ISSUE: [
+        "重复扣款", "多扣", "支付失败", "支付处理中", "支付是否处于处理中",
+        "支付结果", "支付状态", "扣费", "交易未确认", "payment failed"
+    ],
+    IntentCategory.ACCOUNT_SECURITY: ["账户被盗", "账号被盗", "异常登录", "重置密码", "两步验证"],
+    IntentCategory.TECHNICAL_LOGIN: ["无法登录", "登录失败", "401", "验证码"],
+    IntentCategory.TECHNICAL_CRASH: ["崩溃", "闪退", "500", "报错", "crash"],
+    IntentCategory.TECHNICAL: [
+        "页面打不开", "页面无法打开", "页面加载", "加载不出来", "网络请求失败", "网络失败", "访问页面", "403"
+    ],
+    IntentCategory.BILLING: ["账单", "金额核对", "账单金额"],
+}
+
+
+def _intent_domain(intent: IntentCategory) -> str:
+    """返回用于判断跨域协作的稳定业务域，不改变原有 intent_group。"""
+    if intent in {
+        IntentCategory.TECHNICAL,
+        IntentCategory.TECHNICAL_LOGIN,
+        IntentCategory.TECHNICAL_CRASH,
+    }:
+        return "technical"
+    if intent in {
+        IntentCategory.BILLING,
+        IntentCategory.ACCOUNT,
+        IntentCategory.ACCOUNT_SECURITY,
+        IntentCategory.REFUND,
+        IntentCategory.INVOICE,
+        IntentCategory.PAYMENT_ISSUE,
+    }:
+        return "billing"
+    if intent == IntentCategory.HUMAN_HANDOFF:
+        return "escalation"
+    return "general"
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
@@ -151,6 +266,7 @@ class IntentRecognizer:
         base_url: Optional[str] = None,
         model: str = "claude-3-5-sonnet-20241022",
         confidence_threshold: float = 0.5,
+        embedding_fallback_threshold: float = 0.45,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -158,6 +274,13 @@ class IntentRecognizer:
         self.client    = AsyncAnthropic(**kwargs)
         self.model     = model
         self.threshold = confidence_threshold
+        # LLM 识别失败时，只有达到该阈值的 Embedding 结果才允许接管。
+        # 具体细粒度 Pattern 会优先于 Embedding；低分结果最终回到 OTHER，
+        # 避免低置信度的向量或宽泛关键词直接改变路由。
+        self.embedding_fallback_threshold = max(
+            0.0,
+            min(1.0, float(embedding_fallback_threshold)),
+        )
         # 本地字符 n-gram 向量始终可用；如果未来客户端暴露 embeddings 资源，
         # _embed_text 会优先尝试远端向量，否则自动回退本地向量。
         self._embedding_enabled = True
@@ -199,6 +322,11 @@ class IntentRecognizer:
             emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
 
         intent, confidence, source_scores = self._vote(llm, emb, pat)
+        source_intents = {
+            "llm": self._intent_value(llm.get("intent")),
+            "embedding": self._intent_value(emb.get("intent")),
+            "pattern": self._intent_value(pat.get("intent")),
+        }
         # 明确的 500/服务不可用属于崩溃类故障；避免 LLM/embedding 的泛化结果
         # 将它降级成笼统的 technical，保证技术故障能够进入对应排障流程。
         normalized_message = message.lower()
@@ -208,6 +336,21 @@ class IntentRecognizer:
             source_scores["rule_override"] = 1.0
         entities = self._extract_entities(message)
         urgency  = self._urgency(message, intent)
+        secondary_intents, compound_trigger = self._detect_secondary_intents(message, intent)
+        # 复合请求中，多个来源分摊置信度后可能刚好低于总阈值，
+        # 将本来清晰的 LLM 主意图错误降级为 OTHER。只在已经通过独立
+        # 复合触发规则、且 LLM 自身达到阈值时恢复主意图；单意图路径不受影响。
+        if (
+            intent == IntentCategory.OTHER
+            and secondary_intents
+            and not llm.get("failed")
+            and llm.get("intent") != IntentCategory.OTHER
+            and float(llm.get("confidence", 0.0) or 0.0) >= self.threshold
+        ):
+            intent = llm["intent"]
+            confidence = max(confidence, float(llm.get("confidence", 0.0) or 0.0))
+            source_scores["compound_primary_rescue"] = float(llm.get("confidence", 0.0) or 0.0)
+            secondary_intents, compound_trigger = self._detect_secondary_intents(message, intent)
 
         result = IntentResult(
             intent=intent,
@@ -218,6 +361,9 @@ class IntentRecognizer:
             reasoning=llm.get("reasoning", ""),
             latency_ms=(time.monotonic() - t0) * 1000,
             source_scores=source_scores,
+            source_intents=source_intents,
+            secondary_intents=secondary_intents,
+            compound_trigger=compound_trigger,
         )
 
         # LRU 缓存
@@ -259,15 +405,18 @@ class IntentRecognizer:
                 for m in history[-3:]
             )
 
-        prompt = f"""你是客服意图分析专家。根据示例判断用户意图，返回 JSON。
+        prompt = f"""你是客服意图分析专家。根据示例判断用户意图，通过 classify_intent 工具返回结果。
 如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类。
 例如退款优先返回 refund，发票优先返回 invoice，登录故障优先返回 technical_login。
+意图边界：
+- request 表示用户要求修改、取消或更新某项内容，例如修改收货地址、取消订单或变更订单信息；
+- logistics 表示用户询问物流状态、配送时效或运输节点。只有询问物流状态、配送时效、运输进度时才返回 logistics；
+- 如果用户是在要求执行地址、订单或其他信息变更，即使对象涉及收货地址，也优先返回 request，不要仅因出现“地址”或“订单”就判断为 logistics。
 
         {ctx}
         用户消息: "{message}"
 
-返回格式（仅 JSON，不要其他文字）:
-{{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
+请务必调用 classify_intent 工具。intent 必须是给定枚举中的一个值，confidence 必须是 0 到 1 之间的数字。
 
 可选意图: {", ".join(c.value for c in IntentCategory)}"""
         prompt = self._clean_text(prompt)
@@ -277,19 +426,61 @@ class IntentRecognizer:
                 model=self.model,
                 max_tokens=256,
                 temperature=0.1,
+                tools=[_INTENT_TOOL],
+                tool_choice={"type": "tool", "name": _INTENT_TOOL_NAME},
+                extra_body={"thinking": {"type": "disabled"}},
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            data = json.loads(raw[s:e])
+            data = self._extract_intent_tool_input(resp.content)
+            if data is None:
+                raise ValueError(f"未收到有效的 {_INTENT_TOOL_NAME} 工具调用")
+
+            intent = data.get("intent")
+            if not isinstance(intent, str):
+                raise ValueError("工具返回的 intent 不是字符串")
+            intent = _INTENT_ALIASES.get(intent, intent)
             try:
-                data["intent"] = IntentCategory(data["intent"])
-            except ValueError:
-                data["intent"] = IntentCategory.OTHER
-            return data
+                intent = IntentCategory(intent)
+            except ValueError as ex:
+                raise ValueError(f"工具返回了未注册的 intent: {intent!r}") from ex
+
+            confidence = data.get("confidence")
+            if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+                raise ValueError("工具返回的 confidence 不是数字")
+            confidence = float(confidence)
+            if not 0.0 <= confidence <= 1.0:
+                raise ValueError(f"工具返回的 confidence 超出范围: {confidence}")
+
+            reasoning = data.get("reasoning", "")
+            if not isinstance(reasoning, str):
+                raise ValueError("工具返回的 reasoning 不是字符串")
+            return {
+                "intent": intent,
+                "confidence": confidence,
+                "reasoning": reasoning,
+            }
         except Exception as ex:
             logger.warning(f"LLM 识别失败: {ex}")
             return {"intent": IntentCategory.OTHER, "confidence": 0.0, "reasoning": "LLM 失败", "failed": True}
+
+    @staticmethod
+    def _extract_intent_tool_input(content: Any) -> Optional[Dict[str, Any]]:
+        """从 Anthropic 风格响应中提取指定工具调用的参数。"""
+        for block in content or []:
+            block_type = getattr(block, "type", None)
+            name = getattr(block, "name", None)
+            input_data = getattr(block, "input", None)
+            if isinstance(block, dict):
+                block_type = block.get("type", block_type)
+                name = block.get("name", name)
+                input_data = block.get("input", input_data)
+            if (
+                block_type == "tool_use"
+                and name == _INTENT_TOOL_NAME
+                and isinstance(input_data, dict)
+            ):
+                return input_data
+        return None
 
     async def _embedding_recognize(self, message: str) -> Dict[str, Any]:
         """策略 2：Embedding 向量相似度匹配。"""
@@ -308,11 +499,105 @@ class IntentRecognizer:
             logger.warning(f"Embedding 识别失败: {ex}")
             return {"intent": IntentCategory.OTHER, "confidence": 0.0}
 
+    def _detect_secondary_intents(
+        self,
+        message: str,
+        primary_intent: IntentCategory,
+    ) -> tuple[List[IntentCategory], str]:
+        """只为明确的跨域复合请求补充次意图。
+
+        这是一个独立于三路主意图投票的保守规则层：先要求出现明确的复合
+        连接词，再把分句分别映射到已有意图枚举。单纯关键词共现不会触发，
+        因此不会把“退款页面打不开”硬拆为退款和技术两个意图。
+        """
+        text = self._clean_text(message).strip()
+        if primary_intent == IntentCategory.HUMAN_HANDOFF:
+            # 人工升级是终止路由；业务背景保留在原始消息/交接摘要中，
+            # 不再将其建模为第二个业务意图或辅助 Agent。
+            return [], ""
+        trigger = _COMPOUND_STRONG_TRIGGER_RE.search(text)
+        if not text or trigger is None:
+            return [], ""
+
+        clauses = [
+            clause.strip()
+            for clause in _COMPOUND_CLAUSE_SPLIT_RE.split(text)
+            if clause and clause.strip()
+        ]
+        if len(clauses) < 2 and primary_intent != IntentCategory.HUMAN_HANDOFF:
+            return [], ""
+
+        clause_intents: List[IntentCategory] = []
+        for clause in clauses:
+            candidates: List[tuple[int, IntentCategory]] = []
+            lowered_clause = clause.casefold()
+            for intent, keywords in _COMPOUND_PATTERNS.items():
+                matched_lengths = [
+                    len(keyword)
+                    for keyword in keywords
+                    if keyword.casefold() in lowered_clause
+                ]
+                if matched_lengths:
+                    candidates.append((max(matched_lengths), intent))
+            if candidates:
+                # 一个普通分句只保留最明确的业务候选，避免在一个诉求内制造
+                # 多个意图；但“要求人工 + 业务背景”是明确的双层语义，必须
+                # 同时保留人工请求和业务背景，否则会丢掉人工主意图的上下文。
+                candidates.sort(key=lambda item: (-item[0], item[1].value))
+                clause_intents.append(candidates[0][1])
+                if candidates[0][1] == IntentCategory.HUMAN_HANDOFF:
+                    business_candidate = next(
+                        (
+                            intent
+                            for _, intent in candidates
+                            if intent != IntentCategory.HUMAN_HANDOFF
+                        ),
+                        None,
+                    )
+                    if business_candidate is not None:
+                        clause_intents.append(business_candidate)
+
+        candidate_intents = list(dict.fromkeys(clause_intents))
+        # 细粒度意图已经代表同一业务域时，去掉同域的泛化标签，
+        # 例如“申请退款”同时命中 refund 和 billing，只保留 refund。
+        specific_domains = {
+            _intent_domain(intent)
+            for intent in candidate_intents
+            if intent in _SPECIFIC_INTENTS and intent != IntentCategory.HUMAN_HANDOFF
+        }
+        candidate_intents = [
+            intent
+            for intent in candidate_intents
+            if not (
+                intent in _GENERIC_INTENTS
+                and _intent_domain(intent) in specific_domains
+            )
+        ]
+        if len(candidate_intents) < 2:
+            return [], ""
+
+        primary_domain = _intent_domain(primary_intent)
+        secondary: List[IntentCategory] = []
+        for intent in candidate_intents:
+            if intent == primary_intent:
+                continue
+            # 人工请求是路由主意图，不作为普通业务的次意图；反过来，
+            # 人工主意图需要保留订单/退款/技术等原始业务背景。
+            if primary_intent != IntentCategory.HUMAN_HANDOFF and intent == IntentCategory.HUMAN_HANDOFF:
+                continue
+            if primary_intent != IntentCategory.HUMAN_HANDOFF and _intent_domain(intent) == primary_domain:
+                continue
+            secondary.append(intent)
+
+        if not secondary:
+            return [], ""
+        return secondary[:3], trigger.group(0)
+
     def _pattern_recognize(self, message: str) -> Dict[str, Any]:
         """策略 3：关键词模式匹配（同步，零延迟兜底）。"""
         msg = message.lower()
         specific_patterns = {
-            IntentCategory.HUMAN_HANDOFF: ["转人工", "人工客服", "找人工"],
+            IntentCategory.HUMAN_HANDOFF: ["转人工", "人工客服", "找人工", "找经理", "supervisor"],
             IntentCategory.ORDER_STATUS: ["订单状态", "发货了吗", "处理到哪", "order status"],
             IntentCategory.LOGISTICS: ["物流", "快递", "配送", "运单", "delivery", "shipping"],
             IntentCategory.REFUND: ["退款", "退货", "refund", "return"],
@@ -321,10 +606,13 @@ class IntentRecognizer:
             IntentCategory.ACCOUNT_SECURITY: ["被盗", "异常登录", "重置密码", "两步验证", "安全"],
             IntentCategory.TECHNICAL_LOGIN: ["无法登录", "登录失败", "401", "验证码"],
             IntentCategory.TECHNICAL_CRASH: ["崩溃", "闪退", "500", "报错", "crash"],
+            IntentCategory.TECHNICAL: [
+                "页面打不开", "页面无法打开", "页面加载", "加载不出来",
+                "网络请求失败", "网络失败", "访问页面", "403",
+            ],
         }
         generic_patterns = {
-            IntentCategory.ESCALATION: ["投诉", "经理", "supervisor"],
-            IntentCategory.COMPLAINT:  ["太差", "糟糕", "horrible", "等了很久"],
+            IntentCategory.COMPLAINT:  ["投诉", "太差", "糟糕", "horrible", "等了很久"],
             IntentCategory.QUERY:      ["?", "？", "怎么", "什么", "status"],
             IntentCategory.REQUEST:    ["帮我", "需要", "please", "help"],
             IntentCategory.GREETING:   ["你好", "嗨", "hello", "hi"],
@@ -350,10 +638,17 @@ class IntentRecognizer:
             "pattern": float(pat.get("confidence", 0.0) or 0.0),
         }
         if llm.get("failed"):
-            if emb.get("intent") != IntentCategory.OTHER and emb.get("confidence", 0.0) > 0:
+            pattern_intent = pat.get("intent", IntentCategory.OTHER)
+            pattern_confidence = float(pat.get("confidence", 0.0) or 0.0)
+            if pattern_intent in _SPECIFIC_INTENTS and pattern_confidence > 0:
+                return pattern_intent, source_scores["pattern"], source_scores
+
+            embedding_confidence = float(emb.get("confidence", 0.0) or 0.0)
+            if (
+                emb.get("intent") != IntentCategory.OTHER
+                and embedding_confidence >= self.embedding_fallback_threshold
+            ):
                 return emb["intent"], source_scores["embedding"], source_scores
-            if pat.get("intent") != IntentCategory.OTHER and pat.get("confidence", 0.0) > 0:
-                return pat["intent"], source_scores["pattern"], source_scores
             return IntentCategory.OTHER, 0.0, source_scores
 
         if self._embedding_enabled:
@@ -451,7 +746,7 @@ class IntentRecognizer:
         for level, kws in _URGENCY_KEYWORDS.items():
             if any(kw in msg for kw in kws):
                 return level
-        if intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
+        if intent == IntentCategory.HUMAN_HANDOFF:
             return UrgencyLevel.HIGH
         if intent == IntentCategory.COMPLAINT:
             return UrgencyLevel.MEDIUM
@@ -473,6 +768,17 @@ class IntentRecognizer:
     @staticmethod
     def _unique(values: List[str]) -> List[str]:
         return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
+
+    @staticmethod
+    def _intent_value(value: Any) -> str:
+        if isinstance(value, IntentCategory):
+            return value.value
+        if isinstance(value, str):
+            value = _INTENT_ALIASES.get(value, value)
+        try:
+            return IntentCategory(value).value
+        except (TypeError, ValueError):
+            return IntentCategory.OTHER.value
 
     @staticmethod
     def _best_pattern_match(
