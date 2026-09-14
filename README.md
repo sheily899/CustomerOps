@@ -171,7 +171,3 @@ Next steps:
 2. add authentication, role-based access control, approval steps, and durable audit logs;
 3. package a sanitized, reproducible public evaluation set and publish metrics with definitions;
 4. add deployment profiles and automated quality checks for different environments.
-
-## License
-
-No license is currently declared for this repository. Add an explicit license before third-party reuse or redistribution.
